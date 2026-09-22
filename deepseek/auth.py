@@ -24,6 +24,12 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, Optional
 
+# Default Playwright browser channel. "chrome" uses the installed Google Chrome
+# (needed to read a profile it created, e.g. cookies encrypted with Chrome's
+# Keychain key). Pass channel=None to use Playwright's bundled Chromium, or
+# "chromium-headless-shell" for the light headless shell.
+DEFAULT_CHANNEL: Optional[str] = "chrome"
+
 from playwright.sync_api import sync_playwright
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -136,6 +142,25 @@ def _wait_for_token(page, timeout: float) -> Optional[str]:
     return None
 
 
+def _launch_context(p, profile_dir: Path, headless: bool, channel: Optional[str]):
+    """Launch a persistent context for `profile_dir`, preferring `channel`.
+
+    `channel="chrome"` reuses the installed Google Chrome so it can read the
+    cookies it wrote (Chrome encrypts them with a Keychain key). A None channel
+    uses Playwright's bundled Chromium. If the requested channel isn't available,
+    fall back to the bundled browser rather than failing outright.
+    """
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    kwargs: dict = {"headless": headless, "args": LAUNCH_ARGS}
+    if channel:
+        kwargs["channel"] = channel
+    try:
+        return p.chromium.launch_persistent_context(str(profile_dir), **kwargs)
+    except Exception:
+        kwargs.pop("channel", None)
+        return p.chromium.launch_persistent_context(str(profile_dir), **kwargs)
+
+
 def _safe_goto(page, url: str) -> None:
     """Navigate, tolerating the benign `net::ERR_ABORTED` that DeepSeek's SPA
     redirects and the AWS WAF check often raise mid-navigation. We wait only for
@@ -154,6 +179,7 @@ def login(
     profile_dir: Path = DEFAULT_PROFILE_DIR,
     headless: bool = False,
     assume_logged_out: bool = False,
+    channel: Optional[str] = DEFAULT_CHANNEL,
 ) -> Session:
     """Interactive login. Opens a visible window and waits for you to sign in by
     hand (and clear the AWS WAF human-check); once a token appears it captures
@@ -166,14 +192,7 @@ def login(
     pass this so the window doesn't visibly bounce CHAT_URL -> SIGNIN_URL."""
     profile_dir.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as p:
-        try:
-            context = p.chromium.launch_persistent_context(
-                str(profile_dir), headless=headless, channel="chrome", args=LAUNCH_ARGS,
-            )
-        except Exception:
-            context = p.chromium.launch_persistent_context(
-                str(profile_dir), headless=headless, args=LAUNCH_ARGS,
-            )
+        context = _launch_context(p, profile_dir, headless, channel)
         page = context.pages[0] if context.pages else context.new_page()
 
         # Normally we first land on CHAT_URL to reuse an already-signed-in
@@ -200,20 +219,15 @@ def login(
         return session
 
 
-def _headless_refresh(profile_dir: Path) -> Optional[Session]:
+def _headless_refresh(
+    profile_dir: Path, channel: Optional[str] = DEFAULT_CHANNEL
+) -> Optional[Session]:
     """Try to capture a token headlessly from the persistent profile. Returns a
     saved Session if the profile is still signed in, else None. Never opens a
     visible window."""
     profile_dir.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as p:
-        try:
-            context = p.chromium.launch_persistent_context(
-                str(profile_dir), headless=True, channel="chrome", args=LAUNCH_ARGS,
-            )
-        except Exception:
-            context = p.chromium.launch_persistent_context(
-                str(profile_dir), headless=True, args=LAUNCH_ARGS,
-            )
+        context = _launch_context(p, profile_dir, True, channel)
         page = context.pages[0] if context.pages else context.new_page()
         try:
             _safe_goto(page, CHAT_URL)
@@ -231,6 +245,8 @@ def get_session(
     session_file: Path = DEFAULT_SESSION_FILE,
     max_age: int = SESSION_MAX_AGE,
     allow_interactive: bool = True,
+    channel: Optional[str] = DEFAULT_CHANNEL,
+    fallback_channel: Optional[str] = None,
 ) -> Session:
     """Return a usable session: cached file if fresh, else a headless refresh
     from the browser profile.
@@ -246,7 +262,12 @@ def get_session(
         return cached
 
     # Try a headless refresh from the (presumably logged-in) persistent profile.
-    session = _headless_refresh(profile_dir)
+    session = _headless_refresh(profile_dir, channel)
+    if session is None and fallback_channel and fallback_channel != channel:
+        # The preferred (lighter) channel couldn't read the profile — e.g. a
+        # headless shell can't decrypt Chrome-encrypted cookies. Retry with the
+        # profile's native browser.
+        session = _headless_refresh(profile_dir, fallback_channel)
     if session is not None:
         return session
 
@@ -258,7 +279,7 @@ def get_session(
     # happens once — later calls capture the token headlessly. We just confirmed
     # (above) there's no token, so go straight to the sign-in page.
     print("[auth] No valid session found — opening a browser window to log in...")
-    return login(profile_dir=profile_dir, assume_logged_out=True)
+    return login(profile_dir=profile_dir, assume_logged_out=True, channel=channel)
 
 
 if __name__ == "__main__":

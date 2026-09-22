@@ -14,6 +14,26 @@ SERVER_INTERACTIVE_LOGIN = os.getenv("SERVER_INTERACTIVE_LOGIN", "1").lower() no
     "0", "false", "no", "off",
 )
 
+# Background session refresher: periodically re-captures the token from the
+# persistent browser profile so a request never hits an expired token. Runs in a
+# daemon thread and never opens a visible window (allow_interactive=False).
+SESSION_REFRESH_ENABLED = os.getenv("SESSION_REFRESH_ENABLED", "1").lower() not in (
+    "0", "false", "no", "off",
+)
+# Refresh well before SESSION_MAX_AGE (6h in deepseek.auth) so the cached token
+# stays fresh. Default 5h.
+SESSION_REFRESH_INTERVAL = int(os.getenv("SESSION_REFRESH_INTERVAL", str(5 * 60 * 60)))
+
+# Playwright browser channel for the (background) headless refresh. The light
+# bundled "chromium-headless-shell" uses far less RAM than full Chrome, but may
+# not decrypt cookies written by Chrome's Keychain-bound profile — so callers
+# fall back to "chrome" when a headless capture comes back empty.
+REFRESH_BROWSER_CHANNEL = os.getenv("REFRESH_BROWSER_CHANNEL", "chromium-headless-shell")
+
+# Fallback channel used when REFRESH_BROWSER_CHANNEL yields no session. Empty
+# string disables the fallback.
+REFRESH_BROWSER_CHANNEL_FALLBACK = os.getenv("REFRESH_BROWSER_CHANNEL_FALLBACK", "chrome")
+
 # Public model ids the server advertises (via /v1/models) and accepts, mapped to
 # DeepSeek's `model_type` wire value. This is the MODEL axis ONLY — it picks
 # which model answers. DeepThink and web Search are orthogonal tools requested

@@ -2,6 +2,7 @@ venv/
 __pycache__/
 *.pyc
 .env
+logs/
 
 # Session artifacts — contain session tokens + cookies. NEVER commit.
 session.json
