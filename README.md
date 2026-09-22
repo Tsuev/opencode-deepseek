@@ -1,4 +1,4 @@
-# DeepSeek API → opencode (агент)
+# Full Free DeepSeek API → opencode (агент)
 
 Локальный **OpenAI-совместимый мост** к бесплатному веб-чату DeepSeek
 ([chat.deepseek.com](https://chat.deepseek.com)), который можно подключить к
