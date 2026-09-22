@@ -19,6 +19,7 @@
 - [Единый путь развёртки (копировать целиком)](#единый-путь-развёртки-копировать-целиком)
 - [Пошагово, с пояснениями](#пошагово-с-пояснениями)
 - [Проверка работоспособности](#проверка-работоспособности)
+- [Куда слать запросы: URL и API-ключ](#куда-слать-запросы-url-и-api-ключ)
 - [Интеграция с opencode](#интеграция-с-opencode)
 - [Переключение моделей, DeepThink и веб-поиск](#переключение-моделей-deepthink-и-веб-поиск)
 - [Переменные окружения](#переменные-окружения)
@@ -200,6 +201,47 @@ HOST=0.0.0.0 PORT=8080 python app.py
 uvicorn server.api:app --host 0.0.0.0 --port 8080
 ```
 
+### 7. Автозапуск при входе в систему (macOS, опционально)
+
+Чтобы сервер поднимался сам и перезапускался при падении, заведите LaunchAgent
+`~/Library/LaunchAgents/com.deepseek.api.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.deepseek.api</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/ВЫ/root/other/Deepseek-API/venv/bin/python</string>
+        <string>app.py</string>
+    </array>
+    <key>WorkingDirectory</key><string>/Users/ВЫ/root/other/Deepseek-API</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOST</key><string>127.0.0.1</string>
+        <key>PORT</key><string>8000</string>
+    </dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardOutPath</key><string>/Users/ВЫ/root/other/Deepseek-API/logs/server.log</string>
+    <key>StandardErrorPath</key><string>/Users/ВЫ/root/other/Deepseek-API/logs/server.err</string>
+</dict>
+</plist>
+```
+
+```bash
+mkdir -p logs
+launchctl load  ~/Library/LaunchAgents/com.deepseek.api.plist   # включить
+launchctl kickstart -k "gui/$(id -u)/com.deepseek.api"          # перезапуск после правок кода
+launchctl unload ~/Library/LaunchAgents/com.deepseek.api.plist  # выключить
+```
+
+> Важно: при `reload=False` (как в `app.py`) изменения кода подхватываются
+> только после перезапуска — используйте `kickstart -k`. Логи смотрите в
+> `logs/server.log` и `logs/server.err`.
+
 ---
 
 ## Проверка работоспособности
@@ -234,6 +276,40 @@ print(r.choices[0].message.content)
 
 ---
 
+## Куда слать запросы: URL и API-ключ
+
+Базовый адрес — `http://localhost:8000/v1` (или `http://127.0.0.1:8000/v1`).
+Порт меняется переменной `PORT` в `.env` / launchd.
+
+| Метод | URL | Назначение |
+| --- | --- | --- |
+| `POST` | `http://localhost:8000/v1/chat/completions` | Чат; стриминг через `"stream": true` |
+| `GET` | `http://localhost:8000/v1/models` | Список моделей (`deepseek-chat`, `deepseek-expert`) |
+| `GET` | `http://localhost:8000/healthz` | Проверка живости (без рейт-лимита) |
+
+**API-ключ:** любой. Мост **не проверяет** `Authorization` и не читает его
+(`server/api.py` не смотрит заголовок), поэтому в SDK, где ключ обязателен
+синтаксически, пишут заглушку — исторически `api_key="unused"`. В чистом HTTP
+через `curl` заголовок `Authorization` вообще не нужен.
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
+```
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"Hi"}]}'
+```
+
+Нестандартные поля (вне схемы OpenAI) передаются через `extra_body`:
+`thinking` (DeepThink), `search` (веб-поиск), `conversation_id` (продолжить
+диалог; при resume модель игнорируется). Лимит — `RATE_LIMIT_PER_MINUTE`
+(по умолчанию 30/мин на IP), `/healthz` не считается.
+
+---
+
 ## Интеграция с opencode
 
 opencode подключается к мосту как к **OpenAI-совместимому провайдеру**.
@@ -247,7 +323,7 @@ opencode подключается к мосту как к **OpenAI-совмес�
 {
   "$schema": "https://opencode.ai/config.json",
   "provider": {
-    "deepseek-bridge": {
+    "local-deepseek": {
       "npm": "@ai-sdk/openai-compatible",
       "name": "DeepSeek (local bridge)",
       "options": {
@@ -275,8 +351,8 @@ opencode подключается к мосту как к **OpenAI-совмес�
 
 - `npm: "@ai-sdk/openai-compatible"` — универсальный OpenAI-совместимый драйвер.
 - `apiKey` обязателен для SDK, но мост его игнорирует.
-- `model` в opencode указывается как `deepseek-bridge/deepseek-chat` или
-  `deepseek-bridge/deepseek-expert`.
+- `model` в opencode указывается как `local-deepseek/deepseek-chat` или
+  `local-deepseek/deepseek-expert`.
 - `limit.context` — приблизительный; уменьшите, если получаете ошибки о
   переполнении контекста.
 
@@ -285,9 +361,9 @@ opencode подключается к мосту как к **OpenAI-совмес�
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "deepseek-bridge/deepseek-chat",
-  "small_model": "deepseek-bridge/deepseek-chat",
-  "provider": { "deepseek-bridge": { "npm": "@ai-sdk/openai-compatible", "name": "DeepSeek (local bridge)", "options": { "baseURL": "http://127.0.0.1:8000/v1", "apiKey": "unused" }, "models": { "deepseek-chat": { "name": "DeepSeek Chat (Instant)", "tool_call": true }, "deepseek-expert": { "name": "DeepSeek Expert", "tool_call": true } } } }
+  "model": "local-deepseek/deepseek-chat",
+  "small_model": "local-deepseek/deepseek-chat",
+  "provider": { "local-deepseek": { "npm": "@ai-sdk/openai-compatible", "name": "DeepSeek (local bridge)", "options": { "baseURL": "http://127.0.0.1:8000/v1", "apiKey": "unused" }, "models": { "deepseek-chat": { "name": "DeepSeek Chat (Instant)", "tool_call": true }, "deepseek-expert": { "name": "DeepSeek Expert", "tool_call": true } } } }
 }
 ```
 
@@ -301,7 +377,7 @@ opencode подключается к мосту как к **OpenAI-совмес�
 ---
 description: Инженерный агент на DeepSeek через локальный мост
 mode: primary
-model: deepseek-bridge/deepseek-expert
+model: local-deepseek/deepseek-expert
 temperature: 0.3
 permission:
   edit: allow
@@ -335,14 +411,48 @@ opencode читает конфиг один раз при старте. **Пол
 `DeepSeek Chat (Instant)` и `DeepSeek Expert` под провайдером
 `DeepSeek (local bridge)`.
 
+### 5. Почему модель не вносит правки (эмуляция tool calling)
+
+У веб-чата DeepSeek **нет канала function calling**, поэтому мост эмулирует его
+текстом: подмешивает в промпт инструкцию «ответь ровно одним блоком
+```` ```tool_calls ```` JSON» и затем парсит ответ обратно
+([server/openai_format.py](server/openai_format.py)). Если модель пишет прозу
+вместо вызова, opencode просто печатает текст и **ничего не выполняет**.
+
+Что сделано для надёжности:
+
+- парсер принимает фенсы, JSON внутри прозы, а также нативный XML/DSML DeepSeek
+  (`<tool_call>`, `function<|tool_sep|>name`);
+- инструкция усилена (запрет прозы + пример + напоминание в конце);
+- плагин дисциплины добавляет позднюю системную инструкцию.
+
+Диагностика: запустите сервер с `DEBUG_TOOLCALLS=1` — при нераспознанном вызове
+в лог (`logs/server.log` или stdout) попадёт сырой ответ модели.
+
+```bash
+DEBUG_TOOLCALLS=1 python app.py
+```
+
+Проверить мост напрямую (без opencode):
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "deepseek-chat",
+  "messages": [{"role":"user","content":"Create a file /tmp/x.txt with hello"}],
+  "tools": [{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"filePath":{"type":"string"},"content":{"type":"string"}}}}}]
+}'
+```
+
+Успех — `"finish_reason": "tool_calls"` и заполненный `message.tool_calls`.
+
 ---
 
 ## Переключение моделей, DeepThink и веб-поиск
 
 | Что | Значение в opencode | Примечание |
 | --- | --- | --- |
-| Быстрая модель | `deepseek-bridge/deepseek-chat` | По умолчанию |
-| Экспертная модель | `deepseek-bridge/deepseek-expert` | Сильнее, медленнее |
+| Быстрая модель | `local-deepseek/deepseek-chat` | По умолчанию |
+| Экспертная модель | `local-deepseek/deepseek-expert` | Сильнее, медленнее |
 | DeepThink (reasoning) | — | Через `extra_body`, см. ниже |
 | Веб-поиск | — | Через `extra_body`, см. ниже |
 
@@ -359,24 +469,45 @@ resp = client.chat.completions.create(
 )
 ```
 
-### Плагин для включения DeepThink в opencode (опционально, экспериментально)
+### Плагин дисциплины инструментов (важно для агента)
 
-`.opencode/plugin/deepseek-thinking.js` в рабочем проекте:
+Из-за эмуляции tool calling (см. выше) модель склонна «описывать» действие
+вместо вызова. Плагин добавляет позднюю системную инструкцию, требующую реальных
+tool calls. Файл авто-подхватывается opencode без правки конфига:
+
+- глобально: `~/.config/opencode/plugin/deepseek-tool-discipline.js`
+- в проекте: `.opencode/plugin/deepseek-tool-discipline.js` (лежит в репозитории)
 
 ```js
-export const DeepSeekThinking = async () => ({
-  "chat.params": async (input, output) => {
-    if (input.model?.providerID === "deepseek-bridge") {
-      output.thinking = true;
-      // output.search = true;
-    }
+export const DeepSeekToolDiscipline = async () => ({
+  "experimental.chat.system.transform": async (input, output) => {
+    if (input?.model?.providerID !== "local-deepseek") return;
+    output.system.push(
+      "CRITICAL: to act you MUST emit real tool calls; never describe the " +
+      "action, never print JSON/XML or a tool_calls block as visible text."
+    );
   },
 });
 ```
 
-> Хук `chat.params` позволяет дополнить параметры запроса к провайдеру.
-> Поведение нестандартных полей зависит от версии opencode/SDK — проверьте на
-> своей сборке. Если флаги не доходят, используйте `curl`/SDK напрямую.
+> Хуки `experimental.*` помечены экспериментальными (проверено на opencode
+> 1.18.x). Если их переименуют, плагин просто перестанет срабатывать и не
+> сломает запуск.
+
+### DeepThink и веб-поиск (опционально)
+
+`thinking`/`search` — нестандартные поля тела запроса; opencode их напрямую не
+передаёт. Их можно добавить хуком `chat.params` (`output.options.thinking =
+true`), но **не включайте reasoning по умолчанию** — он ухудшает соблюдение
+формата tool calls. Через `curl`/SDK они работают сразу:
+
+```python
+resp = client.chat.completions.create(
+    model="deepseek-expert",
+    messages=[{"role": "user", "content": "Что нового в мире?"}],
+    extra_body={"thinking": True, "search": True},
+)
+```
 
 ---
 
@@ -411,8 +542,10 @@ HOST=0.0.0.0 PORT=8080 RATE_LIMIT_PER_MINUTE=60 python app.py
   (см. `server/api.py`). Параллельные запросы встают в очередь — не стоит
   запускать несколько агентов/сессий одновременно.
 - **Tool calling эмулируется.** Мост буферизует ответ и парсит его в tool
-  calls (`server/api.py`, `parse_tool_calls`). Работает, но менее надёжно, чем
-  у нативных API: возможны сбои на сложных многошаговых цепочках.
+  calls (`server/openai_format.py`, `parse_tool_calls`). Парсер терпим к прозе,
+  фенсам и XML/DSML DeepSeek, но это всё равно менее надёжно, чем нативный API:
+  возможны сбои на длинных многошаговых цепочках. Помогает плагин дисциплины и
+  `DEBUG_TOOLCALLS=1` для диагностики.
 - **Нет реального подсчёта токенов.** `usage` — грубая оценка ~4 символа/токен.
 - **Большинство OpenAI-параметров игнорируется** (`temperature`, `top_p`,
   `max_tokens` и т.д.). Действуют только `model`, `messages`, `stream`,
@@ -467,6 +600,21 @@ PORT=8080 python app.py
 
 и укажите `http://127.0.0.1:8080/v1` в `baseURL` провайдера opencode.
 
+**Агент отвечает текстом, но файлы не меняет (нет tool calls)**
+
+1. В `opencode.json` у моделей должно быть `"tool_call": true`.
+2. Проверьте мост напрямую `curl`-запросом с `tools` (см.
+   [Интеграция с opencode](#интеграция-с-opencode)): должен вернуться
+   `"finish_reason": "tool_calls"` и непустой `message.tool_calls`.
+3. Поставьте плагин `deepseek-tool-discipline.js` (глобально или в проект).
+4. Запустите сервер с `DEBUG_TOOLCALLS=1` и изучите сырой ответ модели в логе.
+5. Увеличьте `steps` у агента и используйте `deepseek-expert`.
+
+**Правки кода не применились после редактирования (launchd)**
+
+Сервер под launchd с `reload=False` — перезапустите его:
+`launchctl kickstart -k "gui/$(id -u)/com.deepseek.api"`.
+
 **Изменения в `opencode.json`/агентах не применились**
 
 Перезапустите opencode — конфиг не перезагружается на лету.
@@ -479,9 +627,11 @@ PORT=8080 python app.py
 | --- | --- |
 | `app.py` | Точка входа — запускает сервер |
 | `deepseek/` | Ядро: `DeepSeekClient`, вход (`auth.py`), HTTP-драйвер (`client.py`), PoW (`pow.py`) |
-| `server/` | FastAPI OpenAI-совместимый сервер (`api.py`, `config.py`, `openai_format.py`, `ratelimit.py`, `schemas.py`) |
+| `server/` | FastAPI OpenAI-совместимый сервер (`api.py`, `config.py`, `openai_format.py` — парсер tool calls, `ratelimit.py`, `schemas.py`) |
+| `.opencode/plugin/` | Плагин дисциплины инструментов для opencode |
 | `examples/` | Запускаемые примеры (прямой Python и через сервер) |
 | `session/` | Сохранённая сессия (cookies + токен), **git-ignored** |
+| `logs/` | Логи launchd-сервиса, **git-ignored** |
 | `.env.example` | Шаблон конфигурации |
 | `requirements.txt` | Python-зависимости |
 

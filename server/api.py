@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import os
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -88,6 +89,24 @@ def _is_auth_error(exc: Exception) -> bool:
         return exc.response.status_code in (401, 403)
     msg = str(exc).lower()
     return any(h in msg for h in _AUTH_HINTS)
+
+
+def _tool_names(tools) -> set:
+    """Extract requested tool names from OpenAI tool objects, defensively."""
+    names = set()
+    for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function", t)
+        if isinstance(fn, dict) and fn.get("name"):
+            names.add(fn["name"])
+    return names
+
+
+def _debug_toolcalls() -> bool:
+    return os.getenv("DEBUG_TOOLCALLS", "").strip().lower() not in (
+        "", "0", "false", "no", "off",
+    )
 
 
 def _build_client(force: bool = False) -> DeepSeekClient:
@@ -294,7 +313,9 @@ async def chat_completions(req: ChatCompletionRequest):
         except Exception as e:
             return _error(f"DeepSeek request failed: {e}")
 
-        content, tool_calls = parse_tool_calls(reply.text)
+        content, tool_calls = parse_tool_calls(reply.text, allowed_names=_tool_names(req.tools))
+        if tool_calls is None and _debug_toolcalls():
+            print(f"[toolcalls] no call parsed; raw reply:\n{reply.text}\n", flush=True)
         if req.stream:
             return StreamingResponse(
                 sse_frames(req.model, content, tool_calls, reply.conversation_id),

@@ -25,6 +25,26 @@ _ROLE_LABELS = {"system": "System", "user": "User", "assistant": "Assistant"}
 # Fenced blocks the model may use: ```tool_calls, ```tool_call, ```json or a bare fence.
 _FENCE_RE = re.compile(r"```[a-zA-Z_]*\s*\n?(.*?)```", re.DOTALL)
 
+# DeepSeek sometimes leaks its native tool markup instead of the fenced JSON we
+# ask for. Cover both the XML-ish form and the DSML token form.
+_XML_BLOCK_RE = re.compile(
+    r"<(tool_calls?|function_calls?)\b[^>]*>(.*?)</\1>",
+    re.DOTALL | re.IGNORECASE,
+)
+_FUNC_TAG_RE = re.compile(
+    r"<function\b[^>]*\bname\s*=\s*[\"']([^\"']+)[\"'][^>]*>(.*?)</function>",
+    re.DOTALL | re.IGNORECASE,
+)
+_PARAM_TAG_RE = re.compile(
+    r"<parameter\b[^>]*\bname\s*=\s*[\"']([^\"']+)[\"'][^>]*>(.*?)</parameter>",
+    re.DOTALL | re.IGNORECASE,
+)
+_DSML_SEP_RE = re.compile(
+    r"function\s*<\|tool[_\u2581]?sep\|>\s*([A-Za-z_][\w\-.]*)",
+    re.IGNORECASE,
+)
+_DSML_FENCE_RE = re.compile(r"<\|[^|]*\|>")
+
 
 def _text_of(content) -> str:
     """Extract plain text from a message's content (string or list-of-parts)."""
@@ -74,25 +94,44 @@ def _tool_instructions(tools: List[dict], tool_choice=None) -> str:
     if not specs:
         return ""
     rendered = "\n".join(json.dumps(s, ensure_ascii=False) for s in specs)
+    example = specs[0]["name"]
     instructions = (
         "You can call functions (tools). Available tools, given as JSON Schema:\n\n"
         f"{rendered}\n\n"
-        "When you need to call one or more tools, reply with ONLY a single fenced "
-        "code block in exactly this format and nothing else:\n\n"
+        "To call one or more tools, your ENTIRE reply must be a single fenced code "
+        "block in exactly this format and nothing else:\n\n"
         "```tool_calls\n"
         '[{"name": "<tool_name>", "arguments": {<arguments>}}]\n'
         "```\n\n"
-        "Use the exact tool name and an `arguments` object matching that tool's "
-        "schema. To call several tools, put multiple objects in the array. "
-        "If no tool is needed, answer the user normally in plain text and do NOT "
-        "emit a tool_calls block."
+        "Hard rules:\n"
+        "- The fenced `tool_calls` block must be the WHOLE reply. Never write any "
+        "text, plan, explanation, or reasoning before or after it.\n"
+        "- Never describe the action you are about to take — perform it by emitting "
+        "the block.\n"
+        "- Use the exact tool name and an `arguments` object matching that tool's "
+        "schema. To call several tools, put multiple objects in the array.\n"
+        "- Never use XML/DSML tags such as <tool_call> or <|tool_calls|>.\n"
+        "- Only if no tool is needed, answer normally in plain text and do NOT emit "
+        "a tool_calls block.\n\n"
+        f"Example — to use the `{example}` tool, reply with exactly:\n\n"
+        "```tool_calls\n"
+        f'[{{"name": "{example}", "arguments": {{}}}}]\n'
+        "```"
     )
     if _forced_tool_name(tool_choice) is not None:
         instructions += f"\n\nYou MUST call the tool `{_forced_tool_name(tool_choice)}` now."
+        instructions += " Reply with ONLY the fenced tool_calls block."
     elif tool_choice == "required":
-        instructions += "\n\nYou MUST call one of the tools now."
+        instructions += "\n\nYou MUST call one of the tools now. Reply with ONLY the fenced tool_calls block."
     elif tool_choice == "none":
         instructions += "\n\nDo NOT call any tools; answer in plain text."
+    # Recency reminder: the instruction block sits at the TOP of the prompt, so a
+    # trailing nudge (closest to the model's turn) markedly improves compliance.
+    if tool_choice != "none":
+        instructions += (
+            "\n\nREMINDER: if you are about to perform any action, respond with the "
+            "fenced ```tool_calls block now, as your entire reply — no other text."
+        )
     return instructions
 
 
@@ -151,68 +190,237 @@ def messages_to_prompt(
     return "\n\n".join(lines)
 
 
-def parse_tool_calls(text: str) -> Tuple[str, Optional[List[dict]]]:
+def parse_tool_calls(
+    text: str, allowed_names: Optional[Iterable[str]] = None
+) -> Tuple[str, Optional[List[dict]]]:
     """Split a reply into (visible_content, tool_calls).
 
-    Looks for the last fenced block containing a tool call; falls back to the
-    whole reply being raw JSON. `tool_calls` is None when the reply is plain text.
+    DeepSeek's web chat has no function-calling channel, so the model is told to
+    emit a fenced ``tool_calls`` JSON block. In practice it wraps that block in
+    prose, drops the fence, or leaks its native XML/DSML markup — so we accept
+    all of these and only fall back to plain text when nothing parses.
+
+    `allowed_names` (the tool names from the request) filters out stray JSON that
+    merely looks like a call. `tool_calls` is None when the reply is plain text.
     """
     if not text:
         return text, None
 
+    names = {n for n in (allowed_names or ()) if n}
+
+    # 1. Fenced blocks — the last one usually holds the call (reasoning first).
     blocks = _FENCE_RE.findall(text)
     for block in reversed(blocks):
-        calls = _coerce_calls(block)
+        calls = _coerce_calls(block, names)
         if calls:
             return _FENCE_RE.sub("", text).strip(), calls
 
-    calls = _coerce_calls(text.strip())
+    # 2. Native XML-ish tool markup (<tool_call>/<function_call>...</...>).
+    for _, inner in _XML_BLOCK_RE.findall(text):
+        calls = _parse_xml_calls(inner, names)
+        if calls:
+            return _XML_BLOCK_RE.sub("", text).strip(), calls
+
+    # 3. DeepSeek DSML token form: `function<|tool_sep|>NAME` + JSON body.
+    dsml = _parse_dsml(text, names)
+    if dsml:
+        calls, start, end = dsml
+        cleaned = _DSML_FENCE_RE.sub("", text[:start] + text[end:]).strip()
+        return cleaned, calls
+
+    # 4. Any balanced JSON block embedded in prose.
+    for block in _iter_json_blocks(text):
+        calls = _coerce_calls(block, names)
+        if calls:
+            return text.replace(block, "").strip(), calls
+
+    # 5. The whole reply is just the JSON.
+    calls = _coerce_calls(text.strip(), names)
     if calls:
         return "", calls
 
     return text, None
 
 
-def _coerce_calls(raw: str) -> Optional[List[dict]]:
-    """Turn a JSON blob into OpenAI tool_call objects, or None if it isn't one."""
+def _coerce_calls(raw: str, allowed_names: Optional[Iterable[str]] = None) -> Optional[List[dict]]:
+    """Turn a JSON blob (possibly with surrounding prose) into tool_call objects."""
     raw = (raw or "").strip()
     if not raw:
         return None
-    try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        return None
+    for candidate in _json_candidates(raw):
+        try:
+            data = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        calls = _calls_from_data(data, allowed_names)
+        if calls:
+            return calls
+    return None
 
+
+def _calls_from_data(data, allowed_names=None) -> Optional[List[dict]]:
+    """Normalise a decoded JSON value into OpenAI tool_call objects."""
     if isinstance(data, dict):
-        if isinstance(data.get("tool_calls"), list):
-            data = data["tool_calls"]
-        elif data.get("name"):
-            data = [data]
+        for key in ("tool_calls", "tool_call", "function_call", "calls"):
+            if isinstance(data.get(key), list):
+                data = data[key]
+                break
         else:
-            return None
+            data = [data]
     if not isinstance(data, list):
         return None
 
     calls: List[dict] = []
     for item in data:
-        if not isinstance(item, dict):
-            continue
-        fn = item.get("function") if isinstance(item.get("function"), dict) else {}
-        name = item.get("name") or fn.get("name")
-        if not name:
-            continue
-        args = item.get("arguments")
-        if args is None:
-            args = fn.get("arguments")
-        if args is None:
-            args = item.get("parameters")
-        args_s = args if isinstance(args, str) else json.dumps(args or {}, ensure_ascii=False)
-        calls.append({
-            "id": f"call_{uuid.uuid4().hex[:24]}",
-            "type": "function",
-            "function": {"name": name, "arguments": args_s},
-        })
+        call = _call_from_item(item, allowed_names)
+        if call:
+            calls.append(call)
     return calls or None
+
+
+def _call_from_item(item, allowed_names=None) -> Optional[dict]:
+    """Build one tool_call from a permissive set of field aliases, or None."""
+    if not isinstance(item, dict):
+        return None
+    fn = item.get("function") if isinstance(item.get("function"), dict) else {}
+    name = (
+        item.get("name")
+        or item.get("tool")
+        or item.get("tool_name")
+        or item.get("recipient_name")
+        or fn.get("name")
+    )
+    if not name or not isinstance(name, str):
+        return None
+    if allowed_names and name not in allowed_names:
+        return None
+
+    args = item.get("arguments")
+    if args is None:
+        args = fn.get("arguments")
+    if args is None:
+        args = item.get("parameters")
+    if args is None:
+        args = item.get("args")
+    if args is None:
+        args = item.get("input")
+    args_s = args if isinstance(args, str) else json.dumps(args or {}, ensure_ascii=False)
+    return {
+        "id": f"call_{uuid.uuid4().hex[:24]}",
+        "type": "function",
+        "function": {"name": name, "arguments": args_s},
+    }
+
+
+def _parse_xml_calls(inner: str, allowed_names=None) -> Optional[List[dict]]:
+    """Parse a <function name="...">...</function> block (or JSON inside it)."""
+    calls = []
+    for name, body in _FUNC_TAG_RE.findall(inner or ""):
+        params = {k: v.strip() for k, v in _PARAM_TAG_RE.findall(body)}
+        if params:
+            calls.append({"name": name, "arguments": params})
+        else:
+            block = _first_json(body)
+            calls.append({"name": name, "arguments": block if block is not None else {}})
+    if calls:
+        return _calls_from_data(calls, allowed_names)
+    return _coerce_calls(inner, allowed_names)
+
+
+def _parse_dsml(text: str, allowed_names=None):
+    """Parse DeepSeek's `function<|tool_sep|>NAME` token form + JSON body.
+
+    Returns `(tool_calls, span_start, span_end)` so the caller can strip the
+    leaked markup from the visible content, or None if this isn't a DSML call.
+    """
+    m = _DSML_SEP_RE.search(text or "")
+    if not m:
+        return None
+    name = m.group(1)
+    args, span_end = {}, m.end()
+    brace = next((i for i in range(m.end(), len(text)) if text[i] in "{["), None)
+    if brace is not None:
+        close = _match_bracket(text, brace)
+        if close is not None:
+            try:
+                args = json.loads(text[brace : close + 1])
+                span_end = close + 1
+            except (json.JSONDecodeError, ValueError):
+                args = {}
+    calls = _calls_from_data([{"name": name, "arguments": args}], allowed_names)
+    if not calls:
+        return None
+    return calls, m.start(), span_end
+
+
+def _first_json(text: str):
+    """Decode the first balanced JSON object/array in `text`, else None."""
+    for block in _iter_json_blocks(text or ""):
+        try:
+            return json.loads(block)
+        except (json.JSONDecodeError, ValueError):
+            continue
+    stripped = (text or "").strip()
+    if stripped:
+        try:
+            return json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            return None
+    return None
+
+
+def _json_candidates(raw: str):
+    """Yield progressively: the trimmed text, then every balanced JSON block."""
+    seen = set()
+    stripped = raw.strip()
+    if stripped:
+        seen.add(stripped)
+        yield stripped
+    for block in _iter_json_blocks(raw):
+        if block not in seen:
+            seen.add(block)
+            yield block
+
+
+def _iter_json_blocks(text: str):
+    """Yield every balanced {...} / [...] substring, respecting strings/escapes."""
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] in "{[":
+            end = _match_bracket(text, i)
+            if end is not None:
+                yield text[i : end + 1]
+                i = end + 1
+                continue
+        i += 1
+
+
+def _match_bracket(text: str, start: int) -> Optional[int]:
+    """Return the index of the bracket matching text[start], or None."""
+    opener = text[start]
+    closer = "}" if opener == "{" else "]"
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c == opener:
+            depth += 1
+        elif c == closer:
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
 
 
 # --- OpenAI response shapes -----------------------------------------------
