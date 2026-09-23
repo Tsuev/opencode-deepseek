@@ -163,7 +163,8 @@ def messages_to_prompt(
     A lone user message (no system prompt, no tools) is sent verbatim. Otherwise
     the history is serialised with role labels and a trailing 'Assistant:' cue.
     When `tools` are given, their spec and the required reply format are injected
-    as a leading System block.
+    as the LAST block, immediately before the 'Assistant:' cue: DeepSeek's web
+    chat follows the instruction closest to its own turn far more reliably.
     """
     system_parts: List[str] = []
     convo: List[ChatMessage] = []
@@ -173,12 +174,9 @@ def messages_to_prompt(
         else:
             convo.append(m)
 
-    if tools:
-        instr = _tool_instructions(tools, tool_choice)
-        if instr:
-            system_parts.append(instr)
+    tool_instr = _tool_instructions(tools, tool_choice) if tools else ""
 
-    if not system_parts and len(convo) == 1 and convo[0].role == "user":
+    if not system_parts and not tool_instr and len(convo) == 1 and convo[0].role == "user":
         return _text_of(convo[0].content)
 
     lines = []
@@ -186,6 +184,8 @@ def messages_to_prompt(
     if preamble:
         lines.append(f"System: {preamble}")
     lines.extend(_render_message(m) for m in convo)
+    if tool_instr:
+        lines.append(tool_instr)
     lines.append("Assistant:")
     return "\n\n".join(lines)
 
@@ -234,7 +234,17 @@ def parse_tool_calls(
         if calls:
             return text.replace(block, "").strip(), calls
 
-    # 5. The whole reply is just the JSON.
+    # 5. Pseudo-call syntax the model prints instead of JSON: e.g.
+    #    `bash(command="ls")`, `write(filePath="/x", content="hi")`.
+    pseudo = _parse_pseudo_calls(text, names)
+    if pseudo:
+        calls, spans = pseudo
+        cleaned = text
+        for start, end in sorted(spans, reverse=True):
+            cleaned = cleaned[:start] + cleaned[end:]
+        return cleaned.strip(), calls
+
+    # 6. The whole reply is just the JSON.
     calls = _coerce_calls(text.strip(), names)
     if calls:
         return "", calls
@@ -353,6 +363,112 @@ def _parse_dsml(text: str, allowed_names=None):
     return calls, m.start(), span_end
 
 
+def _parse_pseudo_calls(text: str, allowed_names=None):
+    """Parse `name(arg=val, ...)` pseudo-calls the model prints as prose.
+
+    Returns `(tool_calls, spans)` where each span is the (start, end) of a
+    matched call so the caller can strip it from the visible content, or None.
+    Only names in `allowed_names` are considered, which keeps prose that merely
+    contains an identifier-paren pair from being mistaken for a call.
+    """
+    names = {n for n in (allowed_names or ()) if n}
+    if not names or not text:
+        return None
+    # Longest name first so `write_file` wins over `write` at the same position.
+    calls: List[dict] = []
+    spans: List[Tuple[int, int]] = []
+    for name in sorted(names, key=len, reverse=True):
+        for m in re.finditer(r"(?<![\w.])" + re.escape(name) + r"\s*\(", text):
+            open_idx = m.end() - 1
+            if any(s <= open_idx < e for s, e in spans):
+                continue
+            close = _match_bracket(text, open_idx)
+            if close is None:
+                continue
+            args = _parse_pseudo_args(text[open_idx + 1 : close])
+            if args is None:
+                continue
+            calls.append({
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+            })
+            spans.append((m.start(), close + 1))
+    if not calls:
+        return None
+    return calls, spans
+
+
+def _parse_pseudo_args(inner: str) -> Optional[dict]:
+    """Decode the inside of a `name(...)` call into an arguments dict, else None."""
+    inner = (inner or "").strip()
+    if not inner:
+        return {}
+    if inner[0] in "{[":
+        try:
+            parsed = json.loads(inner)
+        except (json.JSONDecodeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            return parsed
+        if parsed is not None:
+            return {"value": parsed}
+    args: dict = {}
+    for part in _split_top_level(inner, ","):
+        if "=" not in part:
+            return None
+        key, _, value = part.partition("=")
+        key = key.strip().strip("'\"")
+        if not key:
+            return None
+        args[key] = _parse_scalar(value.strip())
+    return args
+
+
+def _parse_scalar(value: str):
+    """Best-effort decode of a single `key=value` right-hand side."""
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        return value[1:-1]
+    return value
+
+
+def _split_top_level(text: str, sep: str) -> List[str]:
+    """Split on `sep`, ignoring separators inside quotes or nested brackets."""
+    parts: List[str] = []
+    buf: List[str] = []
+    depth, quote, esc = 0, None, False
+    for c in text:
+        if quote:
+            buf.append(c)
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == quote:
+                quote = None
+            continue
+        if c in "'\"":
+            quote = c
+            buf.append(c)
+        elif c in "{[(":
+            depth += 1
+            buf.append(c)
+        elif c in "}])":
+            depth -= 1
+            buf.append(c)
+        elif c == sep and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(c)
+    parts.append("".join(buf))
+    return parts
+
+
 def _first_json(text: str):
     """Decode the first balanced JSON object/array in `text`, else None."""
     for block in _iter_json_blocks(text or ""):
@@ -398,22 +514,24 @@ def _iter_json_blocks(text: str):
 def _match_bracket(text: str, start: int) -> Optional[int]:
     """Return the index of the bracket matching text[start], or None."""
     opener = text[start]
-    closer = "}" if opener == "{" else "]"
+    closer = {"{": "}", "[": "]", "(": ")"}.get(opener)
+    if closer is None:
+        return None
     depth = 0
-    in_str = False
+    quote = None
     esc = False
     for i in range(start, len(text)):
         c = text[i]
-        if in_str:
+        if quote:
             if esc:
                 esc = False
             elif c == "\\":
                 esc = True
-            elif c == '"':
-                in_str = False
+            elif c == quote:
+                quote = None
             continue
-        if c == '"':
-            in_str = True
+        if c in "'\"":
+            quote = c
         elif c == opener:
             depth += 1
         elif c == closer:

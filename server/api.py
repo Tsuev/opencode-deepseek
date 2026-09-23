@@ -29,6 +29,7 @@ of blocking on an interactive login window.
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import json
 import os
@@ -190,6 +191,45 @@ def _sse_error(message: str, err_type: str = "server_error") -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\ndata: [DONE]\n\n"
 
 
+# How often to emit an SSE keep-alive comment while a buffered tool reply is
+# still generating. Must stay below the client's idle read timeout.
+_KEEPALIVE_SECONDS = 10.0
+
+
+async def _tool_stream(req: ChatCompletionRequest, prompt: str, model_type):
+    """Stream a buffered tool-call reply without tripping the client's timeout.
+
+    Tool calls are emulated by buffering the whole reply before parsing, which
+    can take minutes for a large write/edit. We run that work as a task and emit
+    SSE keep-alive comments while it runs so the client's idle timer never fires.
+    """
+    task = asyncio.ensure_future(_run_chat_with_retry(prompt, req, model_type))
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=_KEEPALIVE_SECONDS)
+            if task in done:
+                break
+            yield ": keep-alive\n\n"
+
+        try:
+            reply = task.result()
+        except LoginRequired as e:
+            yield _sse_error(str(e), "login_required")
+            return
+        except Exception as e:
+            yield _sse_error(f"DeepSeek request failed: {e}")
+            return
+
+        content, tool_calls = parse_tool_calls(reply.text, allowed_names=_tool_names(req.tools))
+        if tool_calls is None and _debug_toolcalls():
+            print(f"[toolcalls] no call parsed; raw reply:\n{reply.text}\n", flush=True)
+        for frame in sse_frames(req.model, content, tool_calls, reply.conversation_id):
+            yield frame
+    finally:
+        if not task.done():
+            task.cancel()
+
+
 def _stream_with_retry(client: DeepSeekClient, prompt: str,
                        req: ChatCompletionRequest, model_type):
     """Stream a plain-text completion, refreshing the session once if the very
@@ -306,6 +346,11 @@ async def chat_completions(req: ChatCompletionRequest):
     # non-streaming call and then emit SSE frames when the client asked to stream.
     # That also lets us retry on an auth error and still return a clean status.
     if req.tools:
+        if req.stream:
+            return StreamingResponse(
+                _tool_stream(req, prompt, model_type),
+                media_type="text/event-stream",
+            )
         try:
             reply = await _run_chat_with_retry(prompt, req, model_type)
         except LoginRequired as e:
@@ -316,11 +361,6 @@ async def chat_completions(req: ChatCompletionRequest):
         content, tool_calls = parse_tool_calls(reply.text, allowed_names=_tool_names(req.tools))
         if tool_calls is None and _debug_toolcalls():
             print(f"[toolcalls] no call parsed; raw reply:\n{reply.text}\n", flush=True)
-        if req.stream:
-            return StreamingResponse(
-                sse_frames(req.model, content, tool_calls, reply.conversation_id),
-                media_type="text/event-stream",
-            )
         return completion_response(
             req.model, content, prompt, reply.conversation_id, tool_calls
         )
