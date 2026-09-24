@@ -541,6 +541,71 @@ def _match_bracket(text: str, start: int) -> Optional[int]:
     return None
 
 
+# --- truncation detection (continuation support) ----------------------------
+
+# Signals that the model was composing a tool call rather than a plain answer.
+_TOOL_INTENT_RE = re.compile(
+    r'("arguments"|"tool_calls"|"name"\s*:|```|<tool_call|<function_call|<\|tool|function\s*<\|)',
+    re.IGNORECASE,
+)
+
+
+def _bracket_state(text: str) -> Tuple[int, bool]:
+    """Return (nesting depth, ended-inside-a-string?) for brackets in `text`.
+
+    Brackets inside strings/escapes are ignored so trailing JSON is measured
+    rather than the prose around it.
+    """
+    depth, quote, esc = 0, None, False
+    for c in text:
+        if quote:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == quote:
+                quote = None
+            continue
+        if c in "'\"":
+            quote = c
+        elif c in "{[(":
+            depth += 1
+        elif c in "}])":
+            depth -= 1
+    return depth, quote is not None
+
+
+def looks_truncated(text: str, allowed_names: Optional[Iterable[str]] = None) -> bool:
+    """Heuristic: did DeepSeek cut this reply off mid tool call?
+
+    Only consulted after `parse_tool_calls` has already failed, so any positive
+    signal means the model *intended* a call but never finished emitting it. We
+    accept the cost of a false positive (one extra continuation round-trip) in
+    exchange for not silently ending the agent's turn on a truncated call.
+    """
+    if not text:
+        return False
+    names = {n for n in (allowed_names or ()) if n}
+
+    # 1. Unclosed markdown fence: ```tool_calls ... with no trailing ```.
+    if text.count("```") % 2 == 1:
+        return True
+
+    # 2. Native XML block opened but never closed.
+    for tag in ("tool_call", "function_call"):
+        opens = len(re.findall(rf"<{tag}\b", text, re.IGNORECASE))
+        closes = len(re.findall(rf"</{tag}>", text, re.IGNORECASE))
+        if opens > closes:
+            return True
+
+    # 3. JSON array/object left open — only when the model showed call intent.
+    depth, _ = _bracket_state(text)
+    if depth > 0 and (_TOOL_INTENT_RE.search(text) or any(n in text for n in names)):
+        return True
+
+    return False
+
+
 # --- OpenAI response shapes -----------------------------------------------
 
 

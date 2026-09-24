@@ -44,7 +44,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from deepseek.auth import SESSION_MAX_AGE, LoginRequired, get_session
-from deepseek.client import DeepSeekClient
+from deepseek.client import DeepSeekClient, Reply
 
 from .config import (
     MODEL_MAP,
@@ -59,6 +59,7 @@ from .config import (
 )
 from .openai_format import (
     completion_response,
+    looks_truncated,
     messages_to_prompt,
     parse_tool_calls,
     sse_frames,
@@ -179,6 +180,73 @@ async def _run_chat_with_retry(prompt: str, req: ChatCompletionRequest, model_ty
         )
 
 
+# A truncated tool reply is continued this many times before giving up. Each
+# round-trip resumes the same DeepSeek thread and appends the next slice.
+_MAX_CONTINUATIONS = int(os.getenv("TOOLCALL_MAX_CONTINUATIONS", "3"))
+
+# Sent to make DeepSeek finish an answer its output limit cut off.
+_CONTINUE_PROMPT = (
+    "Your previous message was cut off by the output limit before it finished. "
+    "Continue EXACTLY from the character where it stopped. Output only the "
+    "remaining characters — no preamble, no apology, no repetition, and no "
+    "opening code fence (only the missing closing one, if that is what was cut)."
+)
+
+
+async def _continue_reply(prev: Reply, req: ChatCompletionRequest, model_type):
+    """Resume the same DeepSeek thread and return the next slice of the reply.
+
+    On resume the thread keeps its own model, so `model` is passed as None —
+    matching the resume rule in `deepseek.client.stream`."""
+    client = await run_in_threadpool(get_client)
+    try:
+        return await run_in_threadpool(
+            client.chat, _CONTINUE_PROMPT, prev.conversation_id,
+            None, req.thinking, req.search,
+        )
+    except Exception as e:
+        if not _is_auth_error(e):
+            raise
+        client = await run_in_threadpool(get_client, True)
+        return await run_in_threadpool(
+            client.chat, _CONTINUE_PROMPT, prev.conversation_id,
+            None, req.thinking, req.search,
+        )
+
+
+async def _run_tool_chat(prompt: str, req: ChatCompletionRequest, model_type):
+    """Full completion for a tool request, transparently continuing truncations.
+
+    DeepSeek's web output limit can cut a large `write`/`edit` tool call off
+    mid-JSON. Rather than hand opencode a `finish_reason: "stop"` — which ends
+    the agent's turn mid-task — we detect the cut and ask DeepSeek to continue
+    from where it stopped, concatenating slices until the call parses. Returns
+    `(reply, content, tool_calls)`."""
+    names = _tool_names(req.tools)
+    reply = await _run_chat_with_retry(prompt, req, model_type)
+
+    for attempt in range(_MAX_CONTINUATIONS):
+        content, tool_calls = parse_tool_calls(reply.text, allowed_names=names)
+        if tool_calls or not looks_truncated(reply.text, names):
+            return reply, content, tool_calls
+        print(
+            f"[toolcalls] reply truncated (attempt {attempt + 1}/"
+            f"{_MAX_CONTINUATIONS}); requesting continuation...",
+            flush=True,
+        )
+        try:
+            nxt = await _continue_reply(reply, req, model_type)
+        except Exception as e:
+            print(f"[toolcalls] continuation failed: {e}", flush=True)
+            break
+        reply = Reply(text=reply.text + nxt.text, conversation_id=nxt.conversation_id)
+
+    content, tool_calls = parse_tool_calls(reply.text, allowed_names=names)
+    if tool_calls is None and _debug_toolcalls():
+        print(f"[toolcalls] no call parsed; raw reply:\n{reply.text}\n", flush=True)
+    return reply, content, tool_calls
+
+
 def _open_stream(client: DeepSeekClient, prompt: str, req: ChatCompletionRequest, model_type):
     return client.stream(
         prompt, conversation_id=req.conversation_id,
@@ -203,7 +271,7 @@ async def _tool_stream(req: ChatCompletionRequest, prompt: str, model_type):
     can take minutes for a large write/edit. We run that work as a task and emit
     SSE keep-alive comments while it runs so the client's idle timer never fires.
     """
-    task = asyncio.ensure_future(_run_chat_with_retry(prompt, req, model_type))
+    task = asyncio.ensure_future(_run_tool_chat(prompt, req, model_type))
     try:
         while True:
             done, _ = await asyncio.wait({task}, timeout=_KEEPALIVE_SECONDS)
@@ -212,7 +280,7 @@ async def _tool_stream(req: ChatCompletionRequest, prompt: str, model_type):
             yield ": keep-alive\n\n"
 
         try:
-            reply = task.result()
+            reply, content, tool_calls = task.result()
         except LoginRequired as e:
             yield _sse_error(str(e), "login_required")
             return
@@ -220,9 +288,6 @@ async def _tool_stream(req: ChatCompletionRequest, prompt: str, model_type):
             yield _sse_error(f"DeepSeek request failed: {e}")
             return
 
-        content, tool_calls = parse_tool_calls(reply.text, allowed_names=_tool_names(req.tools))
-        if tool_calls is None and _debug_toolcalls():
-            print(f"[toolcalls] no call parsed; raw reply:\n{reply.text}\n", flush=True)
         for frame in sse_frames(req.model, content, tool_calls, reply.conversation_id):
             yield frame
     finally:
@@ -352,15 +417,12 @@ async def chat_completions(req: ChatCompletionRequest):
                 media_type="text/event-stream",
             )
         try:
-            reply = await _run_chat_with_retry(prompt, req, model_type)
+            reply, content, tool_calls = await _run_tool_chat(prompt, req, model_type)
         except LoginRequired as e:
             return _error(str(e), status=503, err_type="login_required")
         except Exception as e:
             return _error(f"DeepSeek request failed: {e}")
 
-        content, tool_calls = parse_tool_calls(reply.text, allowed_names=_tool_names(req.tools))
-        if tool_calls is None and _debug_toolcalls():
-            print(f"[toolcalls] no call parsed; raw reply:\n{reply.text}\n", flush=True)
         return completion_response(
             req.model, content, prompt, reply.conversation_id, tool_calls
         )

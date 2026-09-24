@@ -528,6 +528,8 @@ File `.env` (a copy of `.env.example`):
 | `SESSION_REFRESH_INTERVAL` | `18000` (5 h) | Refresh interval, sec (less than `SESSION_MAX_AGE` = 6 h) |
 | `REFRESH_BROWSER_CHANNEL` | `chromium-headless-shell` | Playwright channel for headless refresh (less RAM) |
 | `REFRESH_BROWSER_CHANNEL_FALLBACK` | `chrome` | Fallback channel if headless can't read cookies; empty — disable |
+| `TOOLCALL_MAX_CONTINUATIONS` | `3` | How many times to ask the model to "continue" when a tool call is cut off by the output limit |
+| `DEBUG_TOOLCALLS` | — | `1` — log the raw model reply when a call can't be parsed |
 
 Example:
 
