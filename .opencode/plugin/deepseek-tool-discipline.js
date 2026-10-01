@@ -21,11 +21,10 @@ export const DeepSeekToolDiscipline = async () => ({
     output.system.push(
       [
         "CRITICAL — tool discipline for the DeepSeek bridge:",
-        "To perform ANY action you MUST emit real tool calls through the API's",
-        "tool-calling channel. Do not describe, plan, or explain the action you",
-        "are about to take.",
-        "Never print JSON, XML, DSML, or a ```tool_calls block as visible text —",
-        "that does not execute anything.",
+        "To perform an action, your ENTIRE reply must be exactly one fenced",
+        "```tool_calls JSON array in the format specified by the bridge.",
+        "Do not put prose, examples, XML, DSML, or pseudo-calls around that block.",
+        "The bridge converts only this complete block into API tool calls.",
         "If a file must be created, written, or edited, invoke the corresponding",
         "tool immediately. If a shell command must run, call the bash tool immediately.",
         "Only answer in plain text when no tool is needed.",

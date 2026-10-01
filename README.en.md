@@ -199,7 +199,7 @@ Alternative via uvicorn with a different address:
 ```bash
 HOST=0.0.0.0 PORT=8080 python app.py
 # or
-uvicorn server.api:app --host 0.0.0.0 --port 8080
+uvicorn server.api:app --host 0.0.0.0 --port 8080 --no-proxy-headers
 ```
 
 ### 7. Auto-start at login (macOS, optional)
@@ -421,8 +421,11 @@ instead of a call, opencode simply prints the text and **executes nothing**.
 
 What was done for reliability:
 
-- the parser accepts fences, JSON embedded in prose, and DeepSeek's native
-  XML/DSML (`<tool_call>`, `function<|tool_sep|>name`);
+- only one complete `tool_calls` block occupying the entire reply becomes
+  calls; JSON in prose, XML/DSML, and pseudo-calls remain ordinary text;
+- the entire array is validated before any call is returned: unknown tools,
+  invalid arguments, or a violated `tool_choice` produce `502 invalid_tool_response`;
+- truncated blocks are continued in the same conversation; partial calls are never returned;
 - the instruction was hardened (no prose + an example + a reminder at the end);
 - a discipline plugin adds a late system instruction.
 
@@ -472,9 +475,9 @@ resp = client.chat.completions.create(
 ### Tool-discipline plugin (important for the agent)
 
 Because tool calling is emulated (see above), the model tends to "describe" the
-action instead of calling it. The plugin adds a late system instruction that
-requires real tool calls. The file is auto-discovered by opencode with no config
-changes:
+action instead of calling it. The plugin adds a late system instruction requiring
+a complete `tool_calls` block, which the bridge converts into API calls. The
+file is auto-discovered by opencode with no config changes:
 
 - globally: `~/.config/opencode/plugin/deepseek-tool-discipline.js`
 - in the project: `.opencode/plugin/deepseek-tool-discipline.js` (lives in the repo)
@@ -484,8 +487,9 @@ export const DeepSeekToolDiscipline = async () => ({
   "experimental.chat.system.transform": async (input, output) => {
     if (input?.model?.providerID !== "local-deepseek") return;
     output.system.push(
-      "CRITICAL: to act you MUST emit real tool calls; never describe the " +
-      "action, never print JSON/XML or a tool_calls block as visible text."
+      "To perform an action, your ENTIRE reply must be exactly one fenced " +
+      "```tool_calls JSON array in the format specified by the bridge. " +
+      "Do not add prose, XML, DSML, or pseudo-calls."
     );
   },
 });
@@ -515,7 +519,9 @@ resp = client.chat.completions.create(
 
 ## Environment variables
 
-File `.env` (a copy of `.env.example`):
+The repository's `.env` (a copy of `.env.example`) loads before settings are
+read by `app.py`, `uvicorn`, `chat.py`, or `deepseek.auth`. Existing environment
+variables take precedence.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -527,7 +533,7 @@ File `.env` (a copy of `.env.example`):
 | `SESSION_REFRESH_ENABLED` | `1` | Background session refresh |
 | `SESSION_REFRESH_INTERVAL` | `18000` (5 h) | Refresh interval, sec (less than `SESSION_MAX_AGE` = 6 h) |
 | `REFRESH_BROWSER_CHANNEL` | `chromium-headless-shell` | Playwright channel for headless refresh (less RAM) |
-| `REFRESH_BROWSER_CHANNEL_FALLBACK` | `chrome` | Fallback channel if headless can't read cookies; empty — disable |
+| `REFRESH_BROWSER_CHANNEL_FALLBACK` | `chrome` | Fallback after a missing token or headless capture error; empty — disable |
 | `TOOLCALL_MAX_CONTINUATIONS` | `3` | How many times to ask the model to "continue" when a tool call is cut off by the output limit |
 | `DEBUG_TOOLCALLS` | — | `1` — log the raw model reply when a call can't be parsed |
 
@@ -541,19 +547,22 @@ HOST=0.0.0.0 PORT=8080 RATE_LIMIT_PER_MINUTE=60 python app.py
 
 ## Limitations and important caveats
 
-- **Request serialization.** A single shared account and the non-reentrant
-  `wasmtime` PoW store mean upstream calls run **one at a time** (see
-  `server/api.py`). Concurrent requests queue up — avoid running several
-  agents/sessions at once.
+- **Request serialization.** The server runs shared-account requests **one at
+  a time**, including streams, retries, and continuations (`server/api.py`).
+  Waiting in the queue does not occupy worker threads. A direct `DeepSeekClient`
+  also serializes generations within one instance. Run one server process:
+  multiple workers or separate clients do not share a queue.
 - **Tool calling is emulated.** The bridge buffers the reply and parses it into
-  tool calls (`server/openai_format.py`, `parse_tool_calls`). The parser is
-  tolerant of prose, fences, and DeepSeek XML/DSML, but this is still less
-  reliable than a native API: failures are possible on long multi-step chains.
-  The discipline plugin and `DEBUG_TOOLCALLS=1` for diagnostics help.
+  tool calls (`server/openai_format.py`, `parse_tool_calls`). One complete
+  `tool_calls` block is required; other forms are not executed. `auto`, `none`,
+  `required`, and forcing an advertised function are supported. Invalid results
+  return an error; SSE responses emit an `error` object before `[DONE]`.
+- **Interrupted output.** EOF without a terminal marker and DeepSeek errors
+  return errors; the upstream output limit becomes `finish_reason: "length"`.
 - **No real token accounting.** `usage` is a rough estimate of ~4 chars/token.
 - **Most OpenAI parameters are ignored** (`temperature`, `top_p`, `max_tokens`,
   etc.). Only `model`, `messages`, `stream`, `conversation_id`, `thinking`,
-  `search` take effect.
+  `search`, `tools`, and `tool_choice` take effect.
 - **Vision is not supported** (no image upload).
 - **Conversation id.** `conversation_id` fixes the model when a thread is
   created; on continuation `model` is ignored.
@@ -585,6 +594,16 @@ modification.
 
 ```bash
 pip install --upgrade wasmtime
+```
+
+On macOS, Xcode's Python 3.9 can terminate with `EXC_GUARD` while loading
+WASM, without a Python traceback. If this happens, create a new environment
+with a separately installed Python 3.12 and reinstall the dependencies. The
+saved login in `session/` can be reused. Check that the module loads before
+starting the server:
+
+```bash
+python -c "from deepseek.pow import DeepSeekPow; DeepSeekPow()"
 ```
 
 **Empty headless session (macOS, Chrome profile)**
@@ -631,6 +650,7 @@ Restart opencode — the config is not reloaded on the fly.
 | Path | Purpose |
 | --- | --- |
 | `app.py` | Entry point — starts the server |
+| `settings.py` | Loads `.env` before settings are read |
 | `deepseek/` | Core: `DeepSeekClient`, login (`auth.py`), HTTP driver (`client.py`), PoW (`pow.py`) |
 | `server/` | FastAPI OpenAI-compatible server (`api.py`, `config.py`, `openai_format.py` — tool-call parser, `ratelimit.py`, `schemas.py`) |
 | `.opencode/plugin/` | Tool-discipline plugin for opencode |
@@ -639,6 +659,18 @@ Restart opencode — the config is not reloaded on the fly.
 | `logs/` | launchd service logs, **git-ignored** |
 | `.env.example` | Config template |
 | `requirements.txt` | Python dependencies |
+| `tests/` | Offline regressions for auth, tools, SSE, API, CLI, and rate limiting |
+
+Checks without a DeepSeek account or browser:
+
+```bash
+python -m unittest discover -s tests -t . -v
+python -c "from deepseek.pow import DeepSeekPow; DeepSeekPow()"
+bash -n ds bin/ds-chat
+node --check .opencode/plugin/deepseek-tool-discipline.js
+```
+
+GitHub Actions runs these checks on Python 3.9 and 3.12.
 
 ---
 
@@ -646,10 +678,19 @@ Restart opencode — the config is not reloaded on the fly.
 
 - Everything in `session/` (cookies + bearer token) stays **on your machine**
   and is excluded from git (`.gitignore`). Never commit `session/`.
+- On POSIX, session/chat state files are replaced atomically with `0600`
+  permissions; their directories and browser profile use `0700`. Only DeepSeek
+  cookies are captured, preserving domain, path, expiry, and HTTPS restrictions.
+- Legacy caches containing a cookie dictionary are recaptured from the browser
+  profile. If that fails, run `python -m deepseek.auth` and restart the server.
 - Passwords/secrets are not stored in `.env` — login is done manually in the
   browser.
 - With `HOST=0.0.0.0` the bridge is reachable on the network with no
   authentication. Bind only to `127.0.0.1` or protect it with a firewall/proxy.
+- `app.py` does not trust forwarded headers; rate limiting uses the ASGI peer
+  address. When launching via uvicorn, use `--no-proxy-headers`. Behind a trusted
+  reverse proxy, enable proxy headers only for its IP using
+  `--forwarded-allow-ips`; never use `*`.
 - Do not publish `session/` or `.env` in public repositories.
 
 ---

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import List, Optional, Union
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from .config import DEFAULT_MODEL
 
@@ -20,6 +20,23 @@ class ChatMessage(BaseModel):
     tool_calls: Optional[List[dict]] = None
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
+
+    @field_validator("content")
+    @classmethod
+    def validate_text_parts(cls, value):
+        if isinstance(value, list):
+            for part in value:
+                if part.get("type") == "text" and not isinstance(part.get("text", ""), str):
+                    raise ValueError("Text content parts must contain a string")
+        return value
+
+    @field_validator("tool_calls")
+    @classmethod
+    def validate_historical_calls(cls, value):
+        for call in value or []:
+            if "function" in call and not isinstance(call["function"], dict):
+                raise ValueError("Historical tool call function must be an object")
+        return value
 
 
 class ChatCompletionRequest(BaseModel):
