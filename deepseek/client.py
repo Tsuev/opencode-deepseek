@@ -24,10 +24,11 @@ from __future__ import annotations
 import json
 import re
 import threading
-from dataclasses import dataclass
 from typing import Iterator, Optional
 
 import httpx
+
+from chat_protocol import Reply, sse_events as _sse_events
 
 from .auth import Session, get_session
 from .pow import DeepSeekPow
@@ -60,17 +61,6 @@ def _decode_cid(conversation_id: Optional[str]) -> tuple[Optional[str], Optional
     return (session_id or None), parent
 
 
-@dataclass
-class Reply:
-    """A completed chat reply plus the id to resume the conversation."""
-
-    text: str
-    conversation_id: str
-
-    def __str__(self) -> str:  # so print(reply) shows the text
-        return self.text
-
-
 def _biz(data: dict) -> dict:
     """Unwrap DeepSeek's `data.biz_data` envelope, raising on API-level errors."""
     if data.get("code") != 0:
@@ -95,10 +85,11 @@ class DeepSeekClient:
         # The wasmtime Store behind the PoW solver is not reentrant; serialise
         # access so concurrent server requests don't corrupt it.
         self._pow_lock = threading.Lock()
+        self._request_lock = threading.Lock()
         self._http = httpx.Client(
             base_url=BASE,
             headers=self._base_headers(),
-            cookies=self.session.cookies,
+            cookies=self.session.cookie_jar(),
             timeout=httpx.Timeout(120.0, read=300.0),
         )
 
@@ -161,8 +152,7 @@ class DeepSeekClient:
             )
         session_id, parent_id = _decode_cid(conversation_id)
         if session_id is None:
-            # New thread: select the model (default when unspecified).
-            session_id = self.create_chat_session()
+            # Create lazily while holding the full-request lock during iteration.
             model_type: Optional[str] = model or DEFAULT_MODEL_TYPE
         else:
             # Resuming: let the existing thread's model stand (send no model_type).
@@ -181,7 +171,8 @@ class DeepSeekClient:
         s = self.stream(prompt, conversation_id=conversation_id,
                         model=model, thinking=thinking, search=search)
         text = "".join(s)
-        return Reply(text=text, conversation_id=s.conversation_id)
+        return Reply(text=text, conversation_id=s.conversation_id,
+                     finish_reason=s.finish_reason)
 
     def close(self) -> None:
         self._http.close()
@@ -191,8 +182,8 @@ class _Stream:
     """Iterable of reply-text chunks. After it's consumed, `.conversation_id`
     holds the token for resuming the conversation."""
 
-    def __init__(self, client: "DeepSeekClient", prompt: str, session_id: str,
-                 parent_id: Optional[int], model: str,
+    def __init__(self, client: "DeepSeekClient", prompt: str, session_id: Optional[str],
+                 parent_id: Optional[int], model: Optional[str],
                  thinking: bool, search: bool):
         self._client = client
         self._prompt = prompt
@@ -201,9 +192,16 @@ class _Stream:
         self._model = model
         self._thinking = thinking
         self._search = search
-        self._message_id: Optional[int] = None
+        self._message_id: Optional[int] = parent_id
+        self.finish_reason = "stop"
 
     def __iter__(self) -> Iterator[str]:
+        with self._client._request_lock:
+            yield from self._generate()
+
+    def _generate(self) -> Iterator[str]:
+        if self._session_id is None:
+            self._session_id = self._client.create_chat_session()
         body = {
             "chat_session_id": self._session_id,
             "parent_message_id": self._parent_id,
@@ -227,142 +225,176 @@ class _Stream:
             yield from _parse_sse(resp.iter_lines(), meta)
         if meta.get("message_id") is not None:
             self._message_id = meta["message_id"]
+        self.finish_reason = meta["finish_reason"]
 
     @property
-    def conversation_id(self) -> str:
+    def conversation_id(self) -> Optional[str]:
+        if self._session_id is None:
+            return None
         return _encode_cid(self._session_id, self._message_id)
 
 
 _CONTENT_PATH = re.compile(r"^response/fragments/(-?\d+)/content$")
 
 
+class DeepSeekStreamError(RuntimeError):
+    """An upstream stream failed or ended without a terminal marker."""
+
+
 def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[str]:
-    """Turn DeepSeek's SSE completion stream into reply-text deltas.
+    """Emit RESPONSE text while retaining the current patch path and operation.
 
-    The stream sends an initial snapshot frame whose `v` is the full response
-    object (with `fragments[]`), then a series of append frames:
-      * {"p":"response/fragments/-1/content","o":"APPEND","v":" what"}  (sets path)
-      * {"v":"'s"}                                                       (appends to it)
-    We track the fragment list and emit only RESPONSE-fragment text.
-
-    Two details matter. Fragments arrive out of band: the snapshot carries
-    whatever exists so far (with DeepThink on, that is the THINK fragment), and
-    later `{"p":"response/fragments","o":"APPEND","v":[{...RESPONSE...}]}` adds
-    the answer. And the paths address the NEWEST fragment as `-1` — which is the
-    THINK fragment for as long as reasoning streams. So we resolve `-1` against
-    the fragments we have actually seen and emit text only for RESPONSE ones,
-    which keeps DeepThink reasoning out of the reply.
-
-    If `meta` is given, the assistant's `message_id` is recorded into it (used to
-    build the resumable conversation_id). The exact field location can vary, so
-    we look in a few plausible spots defensively.
+    EOF succeeds only after FINISHED, INCOMPLETE, a finish event, or [DONE].
+    INCOMPLETE is a deliberate output limit, exposed as finish_reason=length;
+    transport truncation and error events never masquerade as a successful stop.
     """
-    types: list[Optional[str]] = []   # fragment type per index, in arrival order
-    active: Optional[int] = None      # index of the fragment being appended to
-    emitted: dict[int, int] = {}      # fragment index -> chars already emitted
+    meta = meta if meta is not None else {}
+    types: list[Optional[str]] = []
+    emitted: dict[int, str] = {}
+    last_emitted_index = -1
+    current_path, current_operation = None, None
+    terminal = False
 
-    def resolve(idx: int) -> int:
-        """Map DeepSeek's -1 ("newest fragment") onto a concrete index."""
-        return len(types) - 1 if idx == -1 else idx
+    def status(value):
+        nonlocal terminal
+        if value in ("FINISHED", "INCOMPLETE"):
+            terminal = True
+            meta["finish_reason"] = "length" if value == "INCOMPLETE" else "stop"
+        elif value in ("ERROR", "FAILED", "CANCELLED"):
+            raise DeepSeekStreamError(f"DeepSeek response status: {value}")
 
-    def is_response(idx: Optional[int]) -> bool:
-        return idx is not None and 0 <= idx < len(types) and types[idx] == "RESPONSE"
+    def claim(index, fragment):
+        nonlocal last_emitted_index
+        content = fragment.get("content", "")
+        if not isinstance(content, str):
+            raise DeepSeekStreamError("DeepSeek fragment content is not text")
+        previous = emitted.get(index, "")
+        if not content.startswith(previous):
+            raise DeepSeekStreamError("DeepSeek rewrote an already emitted response prefix")
+        if len(content) > len(previous):
+            if index < last_emitted_index:
+                raise DeepSeekStreamError("DeepSeek extended a response fragment after later text was emitted")
+            last_emitted_index = index
+            emitted[index] = content
+            yield content[len(previous):]
 
-    def claim(idx: int, frag: dict) -> Iterator[str]:
-        """Yield whatever a fragment object adds beyond what we already emitted.
-
-        Snapshots and `response/fragments` frames carry whole fragment contents
-        that partly repeat what the content appends already streamed.
-        """
-        content = frag.get("content") or ""
-        seen = emitted.get(idx, 0)
-        if len(content) > seen:
-            emitted[idx] = len(content)
-            return iter(content[seen:])
-        return iter(())
-
-    for line in lines:
-        if not line or not line.startswith("data:"):
-            continue
-        payload = line[len("data:"):].strip()
-        if not payload or payload == "[DONE]":
+    for event, payload in _sse_events(lines):
+        if payload == "[DONE]":
+            terminal = True
+            meta.setdefault("finish_reason", "stop")
+            break
+        if not payload:
+            if event == "finish":
+                terminal = True
+                meta.setdefault("finish_reason", "stop")
+            elif event == "error":
+                raise DeepSeekStreamError("DeepSeek emitted an error event")
             continue
         try:
             obj = json.loads(payload)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
+            raise DeepSeekStreamError("Invalid JSON in DeepSeek SSE event") from exc
+        if not isinstance(obj, dict):
+            raise DeepSeekStreamError("Unexpected DeepSeek SSE event shape")
+        envelope = obj
+        if isinstance(obj.get("v"), dict) and ("error" in obj["v"] or "code" in obj["v"]):
+            envelope = obj["v"]
+        if event == "error" or "error" in envelope or envelope.get("code", 0) != 0:
+            detail = envelope.get("error") or envelope
+            message = (detail.get("message") or detail.get("msg")) if isinstance(detail, dict) else str(detail)
+            raise DeepSeekStreamError(f"DeepSeek stream error: {message or 'unknown error'}")
+        if event == "finish":
+            terminal = True
+            meta.setdefault("finish_reason", "stop")
+
+        value = obj.get("v")
+        if isinstance(value, dict) and "response" in value:
+            response = value["response"]
+            if not isinstance(response, dict):
+                raise DeepSeekStreamError("Unexpected DeepSeek response snapshot")
+            _capture_message_id(meta, value)
+            status(response.get("status"))
+            fragments = response.get("fragments", [])
+            if not isinstance(fragments, list):
+                raise DeepSeekStreamError("Invalid DeepSeek snapshot fragments")
+            fragments = _parse_fragment_list(fragments)
+            types = [f.get("type") for f in fragments]
+            if any(index >= len(types) or types[index] != "RESPONSE" for index in emitted):
+                raise DeepSeekStreamError("DeepSeek replaced an already emitted response fragment")
+            current_path, current_operation = None, None
+            for index, fragment in enumerate(fragments):
+                if types[index] == "RESPONSE":
+                    yield from claim(index, fragment)
             continue
 
-        v = obj.get("v")
-
-        # Snapshot frame: the full response object, replacing what we knew.
-        if isinstance(v, dict) and "response" in v:
-            if meta is not None:
-                _capture_message_id(meta, v)
-            frags = [f for f in v["response"].get("fragments", [])
-                     if isinstance(f, dict)]
-            types = [f.get("type") for f in frags]
-            for idx, frag in enumerate(frags):
-                if frag.get("type") != "RESPONSE":
-                    continue
-                active = idx
-                yield from claim(idx, frag)
-            continue
-
-        p = obj.get("p")
-
-        # A new fragment object was appended to the list — note its type so we
-        # can tell the answer apart from DeepSeek reasoning. The answer often
-        # arrives whole inside this frame, with no content appends after it.
-        if p == "response/fragments" and obj.get("o") == "APPEND":
-            for frag in _parse_fragment_list(v):
-                idx = len(types)
-                types.append(frag.get("type"))
-                if frag.get("type") != "RESPONSE":
-                    continue
-                active = idx
-                yield from claim(idx, frag)
-            continue
-
-        # Path-setting append frame.
         if "p" in obj:
-            m = _CONTENT_PATH.match(p) if isinstance(p, str) else None
-            if m:
-                active = resolve(int(m.group(1)))
-            if meta is not None and isinstance(p, str) and p.endswith("message_id") \
-                    and isinstance(v, int):
-                meta["message_id"] = v
-            if obj.get("o") == "APPEND" and isinstance(v, str) and m \
-                    and is_response(active):
-                emitted[active] = emitted.get(active, 0) + len(v)
-                yield v
+            current_path = obj["p"]
+        if "o" in obj:
+            current_operation = obj["o"]
+        if current_path == "response/status":
+            status(value)
             continue
+        if current_path in ("response/message_id", "response/id"):
+            _set_message_id(meta, value)
+            continue
+        if current_path == "response/fragments":
+            if current_operation != "APPEND":
+                raise DeepSeekStreamError("Unsupported DeepSeek fragment list patch")
+            for fragment in _parse_fragment_list(value):
+                index = len(types)
+                types.append(fragment.get("type"))
+                if types[index] == "RESPONSE":
+                    yield from claim(index, fragment)
+            continue
+        match = _CONTENT_PATH.fullmatch(current_path) if isinstance(current_path, str) else None
+        if not match:
+            continue
+        if current_operation != "APPEND" or not isinstance(value, str):
+            raise DeepSeekStreamError("Unsupported DeepSeek content patch")
+        index = int(match.group(1))
+        if index == -1:
+            index = len(types) - 1
+        if 0 <= index < len(types) and types[index] == "RESPONSE":
+            yield from claim(index, {"content": emitted.get(index, "") + value})
+        elif not 0 <= index < len(types):
+            raise DeepSeekStreamError("DeepSeek content patch references an unknown fragment")
 
-        # Bare append to the current path.
-        if isinstance(v, str) and is_response(active):
-            emitted[active] = emitted.get(active, 0) + len(v)
-            yield v
+    if not terminal:
+        raise DeepSeekStreamError("DeepSeek stream ended before a terminal marker")
 
 
 def _parse_fragment_list(v) -> list:
     """Read the fragment descriptors out of a `response/fragments` APPEND frame.
 
-    The payload is a JSON array of one fragment object, but tolerate a bare
-    object (or something unreadable) rather than dropping the stream.
+    Accept a JSON array or a bare descriptor; reject damaged payloads atomically.
     """
     if isinstance(v, str):
         try:
             v = json.loads(v)
-        except json.JSONDecodeError:
-            return []
+        except json.JSONDecodeError as exc:
+            raise DeepSeekStreamError("Invalid DeepSeek fragment JSON") from exc
     if isinstance(v, dict):
-        return [v]
-    if isinstance(v, list):
-        return [f for f in v if isinstance(f, dict)]
-    return []
+        v = [v]
+    if not isinstance(v, list) or any(not isinstance(f, dict) for f in v):
+        raise DeepSeekStreamError("Invalid DeepSeek fragment descriptors")
+    for fragment in v:
+        if not isinstance(fragment.get("type"), str) or not fragment["type"]:
+            raise DeepSeekStreamError("Invalid DeepSeek fragment type")
+        if "content" in fragment and not isinstance(fragment["content"], str):
+            raise DeepSeekStreamError("DeepSeek fragment content is not text")
+    return v
+
+
+def _set_message_id(meta, value):
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise DeepSeekStreamError("Invalid DeepSeek response message_id")
+    if "message_id" in meta and meta["message_id"] != value:
+        raise DeepSeekStreamError("DeepSeek changed response message_id within one stream")
+    meta["message_id"] = value
 
 
 def _capture_message_id(meta: dict, snapshot: dict) -> None:
-    """Best-effort: pull the assistant message_id out of a snapshot frame.
+    """Pull the assistant message_id out of a snapshot without changing ownership.
 
     DeepSeek nests the assistant message under `response`; we check there first,
     then the snapshot root, accepting `message_id` or `id`.
@@ -370,6 +402,6 @@ def _capture_message_id(meta: dict, snapshot: dict) -> None:
     for container in (snapshot.get("response"), snapshot):
         if isinstance(container, dict):
             mid = container.get("message_id", container.get("id"))
-            if isinstance(mid, int):
-                meta["message_id"] = mid
+            if mid is not None:
+                _set_message_id(meta, mid)
                 return

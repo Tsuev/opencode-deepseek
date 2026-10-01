@@ -22,28 +22,14 @@ from .schemas import ChatMessage
 
 _ROLE_LABELS = {"system": "System", "user": "User", "assistant": "Assistant"}
 
-# Fenced blocks the model may use: ```tool_calls, ```tool_call, ```json or a bare fence.
-_FENCE_RE = re.compile(r"```[a-zA-Z_]*\s*\n?(.*?)```", re.DOTALL)
+# Only the complete, explicitly requested protocol may produce actions.
+_TOOL_BLOCK_RE = re.compile(r"\A```tool_calls[ \t]*\r?\n(.*?)\r?\n```[ \t]*\Z", re.DOTALL)
+_TOOL_START_RE = re.compile(r"\A```tool_calls[ \t]*\r?\n")
+_CLOSING_TOOL_FENCE_RE = re.compile(r"(?m)^```[ \t]*\r?$")
 
-# DeepSeek sometimes leaks its native tool markup instead of the fenced JSON we
-# ask for. Cover both the XML-ish form and the DSML token form.
-_XML_BLOCK_RE = re.compile(
-    r"<(tool_calls?|function_calls?)\b[^>]*>(.*?)</\1>",
-    re.DOTALL | re.IGNORECASE,
-)
-_FUNC_TAG_RE = re.compile(
-    r"<function\b[^>]*\bname\s*=\s*[\"']([^\"']+)[\"'][^>]*>(.*?)</function>",
-    re.DOTALL | re.IGNORECASE,
-)
-_PARAM_TAG_RE = re.compile(
-    r"<parameter\b[^>]*\bname\s*=\s*[\"']([^\"']+)[\"'][^>]*>(.*?)</parameter>",
-    re.DOTALL | re.IGNORECASE,
-)
-_DSML_SEP_RE = re.compile(
-    r"function\s*<\|tool[_\u2581]?sep\|>\s*([A-Za-z_][\w\-.]*)",
-    re.IGNORECASE,
-)
-_DSML_FENCE_RE = re.compile(r"<\|[^|]*\|>")
+
+class ToolCallError(RuntimeError):
+    """The model emitted an invalid or disallowed explicit tool reply."""
 
 
 def _text_of(content) -> str:
@@ -125,8 +111,7 @@ def _tool_instructions(tools: List[dict], tool_choice=None) -> str:
         instructions += "\n\nYou MUST call one of the tools now. Reply with ONLY the fenced tool_calls block."
     elif tool_choice == "none":
         instructions += "\n\nDo NOT call any tools; answer in plain text."
-    # Recency reminder: the instruction block sits at the TOP of the prompt, so a
-    # trailing nudge (closest to the model's turn) markedly improves compliance.
+    # Keep the protocol reminder next to the model's turn.
     if tool_choice != "none":
         instructions += (
             "\n\nREMINDER: if you are about to perform any action, respond with the "
@@ -135,7 +120,7 @@ def _tool_instructions(tools: List[dict], tool_choice=None) -> str:
     return instructions
 
 
-def _render_message(m: ChatMessage) -> str:
+def _render_message(m: ChatMessage, call_names: dict) -> str:
     content = _text_of(m.content)
     if m.role == "assistant" and m.tool_calls:
         calls = []
@@ -144,13 +129,13 @@ def _render_message(m: ChatMessage) -> str:
             name = fn.get("name", "")
             args = fn.get("arguments")
             args_s = args if isinstance(args, str) else json.dumps(args or {}, ensure_ascii=False)
-            calls.append(f"{name}({args_s})")
+            calls.append(f"{name}({args_s}) [call_id={tc.get('id', 'unknown')}]")
         call_txt = "[called tools: " + ", ".join(calls) + "]"
         content = f"{content} {call_txt}".strip() if content else call_txt
         return f"Assistant: {content}"
     if m.role == "tool":
-        label = m.name or "tool"
-        return f"Tool ({label}): {content}"
+        label = m.name or call_names.get(m.tool_call_id, "tool")
+        return f"Tool ({label}, call_id={m.tool_call_id or 'unknown'}): {content}"
     label = _ROLE_LABELS.get(m.role, m.role.capitalize())
     return f"{label}: {content}"
 
@@ -183,427 +168,100 @@ def messages_to_prompt(
     preamble = "\n\n".join(p for p in system_parts if p)
     if preamble:
         lines.append(f"System: {preamble}")
-    lines.extend(_render_message(m) for m in convo)
+    call_names = {}
+    for m in convo:
+        for call in m.tool_calls or []:
+            fn = call.get("function") or {}
+            if isinstance(fn, dict) and call.get("id"):
+                call_names[call["id"]] = fn.get("name", "tool")
+    lines.extend(_render_message(m, call_names) for m in convo)
     if tool_instr:
         lines.append(tool_instr)
     lines.append("Assistant:")
     return "\n\n".join(lines)
 
 
+def validate_tool_choice(tool_choice, allowed_names: Iterable[str]) -> None:
+    """Reject invalid request policies before making an upstream request."""
+    names = set(allowed_names)
+    if tool_choice is None or tool_choice in ("auto", "none"):
+        return
+    if tool_choice == "required":
+        if not names:
+            raise ValueError("tool_choice='required' needs at least one tool")
+        return
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        name = _forced_tool_name(tool_choice)
+        if isinstance(name, str) and name in names:
+            return
+    raise ValueError("tool_choice must be auto, none, required, or an advertised function")
+
+
+def enforce_tool_choice(tool_choice, tool_calls: Optional[List[dict]]) -> None:
+    """Treat the caller's tool policy as a contract, not a model suggestion."""
+    if tool_choice == "none" and tool_calls:
+        raise ToolCallError("The model called a tool while tool_choice='none'")
+    forced = _forced_tool_name(tool_choice)
+    if (tool_choice == "required" or forced) and not tool_calls:
+        raise ToolCallError("The model did not emit the required tool call")
+    if forced and any(c["function"]["name"] != forced for c in tool_calls or []):
+        raise ToolCallError(f"The model called a tool other than the required '{forced}'")
+
+
 def parse_tool_calls(
     text: str, allowed_names: Optional[Iterable[str]] = None
 ) -> Tuple[str, Optional[List[dict]]]:
-    """Split a reply into (visible_content, tool_calls).
+    """Accept one whole fenced tool_calls array, never examples embedded in prose.
 
-    DeepSeek's web chat has no function-calling channel, so the model is told to
-    emit a fenced ``tool_calls`` JSON block. In practice it wraps that block in
-    prose, drops the fence, or leaks its native XML/DSML markup — so we accept
-    all of these and only fall back to plain text when nothing parses.
-
-    `allowed_names` (the tool names from the request) filters out stray JSON that
-    merely looks like a call. `tool_calls` is None when the reply is plain text.
+    All calls and their arguments must validate before any call is returned.
+    Ordinary text, JSON examples, XML/DSML and pseudo-calls remain visible text.
+    Malformed explicit protocol blocks fail closed instead of executing a prefix.
     """
-    if not text:
-        return text, None
-
-    names = {n for n in (allowed_names or ()) if n}
-
-    # 1. Fenced blocks — the last one usually holds the call (reasoning first).
-    blocks = _FENCE_RE.findall(text)
-    for block in reversed(blocks):
-        calls = _coerce_calls(block, names)
-        if calls:
-            return _FENCE_RE.sub("", text).strip(), calls
-
-    # 2. Native XML-ish tool markup (<tool_call>/<function_call>...</...>).
-    for _, inner in _XML_BLOCK_RE.findall(text):
-        calls = _parse_xml_calls(inner, names)
-        if calls:
-            return _XML_BLOCK_RE.sub("", text).strip(), calls
-
-    # 3. DeepSeek DSML token form: `function<|tool_sep|>NAME` + JSON body.
-    dsml = _parse_dsml(text, names)
-    if dsml:
-        calls, start, end = dsml
-        cleaned = _DSML_FENCE_RE.sub("", text[:start] + text[end:]).strip()
-        return cleaned, calls
-
-    # 4. Any balanced JSON block embedded in prose.
-    for block in _iter_json_blocks(text):
-        calls = _coerce_calls(block, names)
-        if calls:
-            return text.replace(block, "").strip(), calls
-
-    # 5. Pseudo-call syntax the model prints instead of JSON: e.g.
-    #    `bash(command="ls")`, `write(filePath="/x", content="hi")`.
-    pseudo = _parse_pseudo_calls(text, names)
-    if pseudo:
-        calls, spans = pseudo
-        cleaned = text
-        for start, end in sorted(spans, reverse=True):
-            cleaned = cleaned[:start] + cleaned[end:]
-        return cleaned.strip(), calls
-
-    # 6. The whole reply is just the JSON.
-    calls = _coerce_calls(text.strip(), names)
-    if calls:
-        return "", calls
-
-    return text, None
-
-
-def _coerce_calls(raw: str, allowed_names: Optional[Iterable[str]] = None) -> Optional[List[dict]]:
-    """Turn a JSON blob (possibly with surrounding prose) into tool_call objects."""
-    raw = (raw or "").strip()
-    if not raw:
-        return None
-    for candidate in _json_candidates(raw):
-        try:
-            data = json.loads(candidate)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        calls = _calls_from_data(data, allowed_names)
-        if calls:
-            return calls
-    return None
-
-
-def _calls_from_data(data, allowed_names=None) -> Optional[List[dict]]:
-    """Normalise a decoded JSON value into OpenAI tool_call objects."""
-    if isinstance(data, dict):
-        for key in ("tool_calls", "tool_call", "function_call", "calls"):
-            if isinstance(data.get(key), list):
-                data = data[key]
-                break
-        else:
-            data = [data]
-    if not isinstance(data, list):
-        return None
-
-    calls: List[dict] = []
-    for item in data:
-        call = _call_from_item(item, allowed_names)
-        if call:
-            calls.append(call)
-    return calls or None
-
-
-def _call_from_item(item, allowed_names=None) -> Optional[dict]:
-    """Build one tool_call from a permissive set of field aliases, or None."""
-    if not isinstance(item, dict):
-        return None
-    fn = item.get("function") if isinstance(item.get("function"), dict) else {}
-    name = (
-        item.get("name")
-        or item.get("tool")
-        or item.get("tool_name")
-        or item.get("recipient_name")
-        or fn.get("name")
-    )
-    if not name or not isinstance(name, str):
-        return None
-    if allowed_names and name not in allowed_names:
-        return None
-
-    args = item.get("arguments")
-    if args is None:
-        args = fn.get("arguments")
-    if args is None:
-        args = item.get("parameters")
-    if args is None:
-        args = item.get("args")
-    if args is None:
-        args = item.get("input")
-    args_s = args if isinstance(args, str) else json.dumps(args or {}, ensure_ascii=False)
-    return {
-        "id": f"call_{uuid.uuid4().hex[:24]}",
-        "type": "function",
-        "function": {"name": name, "arguments": args_s},
-    }
-
-
-def _parse_xml_calls(inner: str, allowed_names=None) -> Optional[List[dict]]:
-    """Parse a <function name="...">...</function> block (or JSON inside it)."""
-    calls = []
-    for name, body in _FUNC_TAG_RE.findall(inner or ""):
-        params = {k: v.strip() for k, v in _PARAM_TAG_RE.findall(body)}
-        if params:
-            calls.append({"name": name, "arguments": params})
-        else:
-            block = _first_json(body)
-            calls.append({"name": name, "arguments": block if block is not None else {}})
-    if calls:
-        return _calls_from_data(calls, allowed_names)
-    return _coerce_calls(inner, allowed_names)
-
-
-def _parse_dsml(text: str, allowed_names=None):
-    """Parse DeepSeek's `function<|tool_sep|>NAME` token form + JSON body.
-
-    Returns `(tool_calls, span_start, span_end)` so the caller can strip the
-    leaked markup from the visible content, or None if this isn't a DSML call.
-    """
-    m = _DSML_SEP_RE.search(text or "")
-    if not m:
-        return None
-    name = m.group(1)
-    args, span_end = {}, m.end()
-    brace = next((i for i in range(m.end(), len(text)) if text[i] in "{["), None)
-    if brace is not None:
-        close = _match_bracket(text, brace)
-        if close is not None:
-            try:
-                args = json.loads(text[brace : close + 1])
-                span_end = close + 1
-            except (json.JSONDecodeError, ValueError):
-                args = {}
-    calls = _calls_from_data([{"name": name, "arguments": args}], allowed_names)
-    if not calls:
-        return None
-    return calls, m.start(), span_end
-
-
-def _parse_pseudo_calls(text: str, allowed_names=None):
-    """Parse `name(arg=val, ...)` pseudo-calls the model prints as prose.
-
-    Returns `(tool_calls, spans)` where each span is the (start, end) of a
-    matched call so the caller can strip it from the visible content, or None.
-    Only names in `allowed_names` are considered, which keeps prose that merely
-    contains an identifier-paren pair from being mistaken for a call.
-    """
-    names = {n for n in (allowed_names or ()) if n}
-    if not names or not text:
-        return None
-    # Longest name first so `write_file` wins over `write` at the same position.
-    calls: List[dict] = []
-    spans: List[Tuple[int, int]] = []
-    for name in sorted(names, key=len, reverse=True):
-        for m in re.finditer(r"(?<![\w.])" + re.escape(name) + r"\s*\(", text):
-            open_idx = m.end() - 1
-            if any(s <= open_idx < e for s, e in spans):
-                continue
-            close = _match_bracket(text, open_idx)
-            if close is None:
-                continue
-            args = _parse_pseudo_args(text[open_idx + 1 : close])
-            if args is None:
-                continue
-            calls.append({
-                "id": f"call_{uuid.uuid4().hex[:24]}",
-                "type": "function",
-                "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
-            })
-            spans.append((m.start(), close + 1))
-    if not calls:
-        return None
-    return calls, spans
-
-
-def _parse_pseudo_args(inner: str) -> Optional[dict]:
-    """Decode the inside of a `name(...)` call into an arguments dict, else None."""
-    inner = (inner or "").strip()
-    if not inner:
-        return {}
-    if inner[0] in "{[":
-        try:
-            parsed = json.loads(inner)
-        except (json.JSONDecodeError, ValueError):
-            parsed = None
-        if isinstance(parsed, dict):
-            return parsed
-        if parsed is not None:
-            return {"value": parsed}
-    args: dict = {}
-    for part in _split_top_level(inner, ","):
-        if "=" not in part:
-            return None
-        key, _, value = part.partition("=")
-        key = key.strip().strip("'\"")
-        if not key:
-            return None
-        args[key] = _parse_scalar(value.strip())
-    return args
-
-
-def _parse_scalar(value: str):
-    """Best-effort decode of a single `key=value` right-hand side."""
-    try:
-        return json.loads(value)
-    except (json.JSONDecodeError, ValueError):
-        pass
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
-        return value[1:-1]
-    return value
-
-
-def _split_top_level(text: str, sep: str) -> List[str]:
-    """Split on `sep`, ignoring separators inside quotes or nested brackets."""
-    parts: List[str] = []
-    buf: List[str] = []
-    depth, quote, esc = 0, None, False
-    for c in text:
-        if quote:
-            buf.append(c)
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == quote:
-                quote = None
-            continue
-        if c in "'\"":
-            quote = c
-            buf.append(c)
-        elif c in "{[(":
-            depth += 1
-            buf.append(c)
-        elif c in "}])":
-            depth -= 1
-            buf.append(c)
-        elif c == sep and depth == 0:
-            parts.append("".join(buf))
-            buf = []
-        else:
-            buf.append(c)
-    parts.append("".join(buf))
-    return parts
-
-
-def _first_json(text: str):
-    """Decode the first balanced JSON object/array in `text`, else None."""
-    for block in _iter_json_blocks(text or ""):
-        try:
-            return json.loads(block)
-        except (json.JSONDecodeError, ValueError):
-            continue
     stripped = (text or "").strip()
-    if stripped:
+    if not stripped.startswith("```tool_calls"):
+        return text, None
+    match = _TOOL_BLOCK_RE.fullmatch(stripped)
+    if not match:
+        raise ToolCallError("Expected one complete fenced tool_calls block")
+    try:
+        data = json.loads(match.group(1))
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ToolCallError("The tool_calls block contains invalid JSON") from exc
+    if not isinstance(data, list) or not data:
+        raise ToolCallError("tool_calls must be a non-empty JSON array")
+    names = set(allowed_names) if allowed_names is not None else None
+    calls = []
+    for item in data:
+        if not isinstance(item, dict):
+            raise ToolCallError("Each tool call must be an object")
+        fn = item.get("function") if isinstance(item.get("function"), dict) else item
+        name = fn.get("name")
+        if not isinstance(name, str) or not name or (names is not None and name not in names):
+            raise ToolCallError("The model called an unadvertised tool")
+        args = fn.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (json.JSONDecodeError, ValueError) as exc:
+                raise ToolCallError("Tool arguments contain invalid JSON") from exc
+        if not isinstance(args, dict):
+            raise ToolCallError("Tool arguments must be a JSON object")
         try:
-            return json.loads(stripped)
-        except (json.JSONDecodeError, ValueError):
-            return None
-    return None
-
-
-def _json_candidates(raw: str):
-    """Yield progressively: the trimmed text, then every balanced JSON block."""
-    seen = set()
-    stripped = raw.strip()
-    if stripped:
-        seen.add(stripped)
-        yield stripped
-    for block in _iter_json_blocks(raw):
-        if block not in seen:
-            seen.add(block)
-            yield block
-
-
-def _iter_json_blocks(text: str):
-    """Yield every balanced {...} / [...] substring, respecting strings/escapes."""
-    i, n = 0, len(text)
-    while i < n:
-        if text[i] in "{[":
-            end = _match_bracket(text, i)
-            if end is not None:
-                yield text[i : end + 1]
-                i = end + 1
-                continue
-        i += 1
-
-
-def _match_bracket(text: str, start: int) -> Optional[int]:
-    """Return the index of the bracket matching text[start], or None."""
-    opener = text[start]
-    closer = {"{": "}", "[": "]", "(": ")"}.get(opener)
-    if closer is None:
-        return None
-    depth = 0
-    quote = None
-    esc = False
-    for i in range(start, len(text)):
-        c = text[i]
-        if quote:
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == quote:
-                quote = None
-            continue
-        if c in "'\"":
-            quote = c
-        elif c == opener:
-            depth += 1
-        elif c == closer:
-            depth -= 1
-            if depth == 0:
-                return i
-    return None
-
-
-# --- truncation detection (continuation support) ----------------------------
-
-# Signals that the model was composing a tool call rather than a plain answer.
-_TOOL_INTENT_RE = re.compile(
-    r'("arguments"|"tool_calls"|"name"\s*:|```|<tool_call|<function_call|<\|tool|function\s*<\|)',
-    re.IGNORECASE,
-)
-
-
-def _bracket_state(text: str) -> Tuple[int, bool]:
-    """Return (nesting depth, ended-inside-a-string?) for brackets in `text`.
-
-    Brackets inside strings/escapes are ignored so trailing JSON is measured
-    rather than the prose around it.
-    """
-    depth, quote, esc = 0, None, False
-    for c in text:
-        if quote:
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == quote:
-                quote = None
-            continue
-        if c in "'\"":
-            quote = c
-        elif c in "{[(":
-            depth += 1
-        elif c in "}])":
-            depth -= 1
-    return depth, quote is not None
+            arguments = json.dumps(args, ensure_ascii=False, allow_nan=False)
+        except ValueError as exc:
+            raise ToolCallError("Tool arguments contain non-finite numbers") from exc
+        calls.append({
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {"name": name, "arguments": arguments},
+        })
+    return "", calls
 
 
 def looks_truncated(text: str, allowed_names: Optional[Iterable[str]] = None) -> bool:
-    """Heuristic: did DeepSeek cut this reply off mid tool call?
-
-    Only consulted after `parse_tool_calls` has already failed, so any positive
-    signal means the model *intended* a call but never finished emitting it. We
-    accept the cost of a false positive (one extra continuation round-trip) in
-    exchange for not silently ending the agent's turn on a truncated call.
-    """
-    if not text:
-        return False
-    names = {n for n in (allowed_names or ()) if n}
-
-    # 1. Unclosed markdown fence: ```tool_calls ... with no trailing ```.
-    if text.count("```") % 2 == 1:
-        return True
-
-    # 2. Native XML block opened but never closed.
-    for tag in ("tool_call", "function_call"):
-        opens = len(re.findall(rf"<{tag}\b", text, re.IGNORECASE))
-        closes = len(re.findall(rf"</{tag}>", text, re.IGNORECASE))
-        if opens > closes:
-            return True
-
-    # 3. JSON array/object left open — only when the model showed call intent.
-    depth, _ = _bracket_state(text)
-    if depth > 0 and (_TOOL_INTENT_RE.search(text) or any(n in text for n in names)):
-        return True
-
-    return False
+    """Continue only an explicitly started tool block missing its closing fence."""
+    stripped = (text or "").strip()
+    return bool(_TOOL_START_RE.match(stripped)) and not _CLOSING_TOOL_FENCE_RE.search(stripped)
 
 
 # --- OpenAI response shapes -----------------------------------------------
@@ -623,7 +281,8 @@ def _est_tokens(text: str) -> int:
 
 
 def completion_response(model: str, content: str, prompt: str,
-                        conversation_id: str = None, tool_calls: List[dict] = None) -> dict:
+                        conversation_id: str = None, tool_calls: List[dict] = None,
+                        finish_reason: str = "stop") -> dict:
     """A full (non-streaming) OpenAI chat.completion object.
 
     `conversation_id` is an extra top-level field (outside OpenAI's schema) you
@@ -631,7 +290,7 @@ def completion_response(model: str, content: str, prompt: str,
     """
     pt, ct = _est_tokens(prompt), _est_tokens(content or "")
     message: dict = {"role": "assistant", "content": content or ""}
-    finish = "stop"
+    finish = finish_reason
     if tool_calls:
         message["tool_calls"] = tool_calls
         message["content"] = content or None
@@ -658,7 +317,8 @@ def completion_response(model: str, content: str, prompt: str,
 
 
 def sse_frames(model: str, content: str, tool_calls: List[dict] = None,
-               conversation_id: str = None, cid: str = None, created: int = None) -> Iterable[str]:
+               conversation_id: str = None, cid: str = None, created: int = None,
+               finish_reason: str = "stop") -> Iterable[str]:
     """Yield OpenAI SSE frames for an already-computed reply.
 
     Used when the caller has a full result (e.g. it ran a non-streaming request
@@ -692,7 +352,7 @@ def sse_frames(model: str, content: str, tool_calls: List[dict] = None,
     else:
         if content:
             yield frame({"content": content})
-        yield frame({}, finish="stop", extra={"conversation_id": conversation_id})
+        yield frame({}, finish=finish_reason, extra={"conversation_id": conversation_id})
     yield "data: [DONE]\n\n"
 
 
@@ -729,7 +389,8 @@ def stream_chunks(model: str, stream: Iterable[str], tool_supported: bool = Fals
         text = "".join(d for d in it if d)
         conversation_id = getattr(stream, "conversation_id", None)
         content, calls = parse_tool_calls(text)
-        yield from sse_frames(model, content, calls, conversation_id, cid=cid, created=created)
+        yield from sse_frames(model, content, calls, conversation_id, cid=cid, created=created,
+                              finish_reason=getattr(stream, "finish_reason", "stop"))
         return
 
     # First frame announces the assistant role.
@@ -738,5 +399,6 @@ def stream_chunks(model: str, stream: Iterable[str], tool_supported: bool = Fals
         if d:
             yield frame({"content": d})
     conversation_id = getattr(stream, "conversation_id", None)
-    yield frame({}, finish="stop", extra={"conversation_id": conversation_id})
+    yield frame({}, finish=getattr(stream, "finish_reason", "stop"),
+                extra={"conversation_id": conversation_id})
     yield "data: [DONE]\n\n"

@@ -8,6 +8,9 @@
 
 > **English version:** [README.en.md](README.en.md)
 
+Опционально этот же мост поддерживает **Qwen Chat**: `Qwen3.8-Omni-Flash`
+и `Qwen3.8-Max`. Настройка ниже в разделе [Qwen Chat](#qwen-chat).
+
 > **Оригинал проекта:** <https://github.com/sums001/Deepseek-API>
 > Это неофициальный проект, не связанный с DeepSeek. Вы используете свой
 > обычный аккаунт DeepSeek и несёте ответственность за соблюдение его условий.
@@ -25,6 +28,7 @@
 - [Чат в терминале](#чат-в-терминале)
 - [Интеграция с opencode](#интеграция-с-opencode)
 - [Переключение моделей, DeepThink и веб-поиск](#переключение-моделей-deepthink-и-веб-поиск)
+- [Qwen Chat](#qwen-chat)
 - [Переменные окружения](#переменные-окружения)
 - [Ограничения и важные нюансы](#ограничения-и-важные-нюансы)
 - [Обслуживание и troubleshooting](#обслуживание-и-troubleshooting)
@@ -201,7 +205,7 @@ python app.py
 ```bash
 HOST=0.0.0.0 PORT=8080 python app.py
 # или
-uvicorn server.api:app --host 0.0.0.0 --port 8080
+uvicorn server.api:app --host 0.0.0.0 --port 8080 --no-proxy-headers
 ```
 
 ### 7. Автозапуск при входе в систему (macOS, опционально)
@@ -472,8 +476,11 @@ opencode читает конфиг один раз при старте. **Пол
 
 Что сделано для надёжности:
 
-- парсер принимает фенсы, JSON внутри прозы, а также нативный XML/DSML DeepSeek
-  (`<tool_call>`, `function<|tool_sep|>name`);
+- только один полный блок `tool_calls`, занимающий весь ответ, превращается
+  в вызовы; JSON в прозе, XML/DSML и псевдовызовы остаются обычным текстом;
+- весь массив проверяется до выдачи: неизвестный инструмент, невалидные
+  аргументы или нарушение `tool_choice` дают `502 invalid_tool_response`;
+- обрезанный блок продолжается в том же диалоге; частичные вызовы не выдаются;
 - инструкция усилена (запрет прозы + пример + напоминание в конце);
 - плагин дисциплины добавляет позднюю системную инструкцию.
 
@@ -523,8 +530,9 @@ resp = client.chat.completions.create(
 ### Плагин дисциплины инструментов (важно для агента)
 
 Из-за эмуляции tool calling (см. выше) модель склонна «описывать» действие
-вместо вызова. Плагин добавляет позднюю системную инструкцию, требующую реальных
-tool calls. Файл авто-подхватывается opencode без правки конфига:
+вместо вызова. Плагин добавляет позднюю системную инструкцию, требующую полного
+блока `tool_calls`, который мост преобразует в API-вызовы. Файл
+авто-подхватывается opencode без правки конфига:
 
 - глобально: `~/.config/opencode/plugin/deepseek-tool-discipline.js`
 - в проекте: `.opencode/plugin/deepseek-tool-discipline.js` (лежит в репозитории)
@@ -534,8 +542,9 @@ export const DeepSeekToolDiscipline = async () => ({
   "experimental.chat.system.transform": async (input, output) => {
     if (input?.model?.providerID !== "local-deepseek") return;
     output.system.push(
-      "CRITICAL: to act you MUST emit real tool calls; never describe the " +
-      "action, never print JSON/XML or a tool_calls block as visible text."
+      "To perform an action, your ENTIRE reply must be exactly one fenced " +
+      "```tool_calls JSON array in the format specified by the bridge. " +
+      "Do not add prose, XML, DSML, or pseudo-calls."
     );
   },
 });
@@ -562,9 +571,80 @@ resp = client.chat.completions.create(
 
 ---
 
+## Qwen Chat
+
+Qwen подключается к тому же `/v1` отдельным провайдером `local-qwen`.
+Он использует ваш аккаунт [chat.qwen.ai](https://chat.qwen.ai/) и его лимиты;
+это не официальный API Alibaba Cloud и не авторизация Qwen Code. Доступность
+моделей и квоты определяет веб-сервис. Поддержка выключена по умолчанию.
+
+1. В активном Python-окружении выполните `python -m qwen.auth`. Войдите вручную
+   в открывшемся окне. Если Google отклоняет автоматизированный браузер, используйте
+   доступный на странице вход по коду на почту своего аккаунта.
+2. Добавьте `QWEN_ENABLED=1` в `.env` и перезапустите сервер.
+3. Добавьте следующий провайдер в существующий объект `provider` конфигурации
+   opencode; затем перезапустите opencode и выберите модель через `/models`.
+
+```json
+"local-qwen": {
+  "npm": "@ai-sdk/openai-compatible",
+  "name": "Qwen Chat (local bridge)",
+  "options": {
+    "baseURL": "http://127.0.0.1:8000/v1",
+    "apiKey": "unused"
+  },
+  "models": {
+    "qwen3.8-omni-flash": {
+      "name": "Qwen3.8 Omni Flash",
+      "tool_call": true,
+      "reasoning": false,
+      "limit": { "context": 64000, "output": 8192 }
+    },
+    "qwen3.8-max": {
+      "name": "Qwen3.8 Max",
+      "tool_call": true,
+      "reasoning": false,
+      "limit": { "context": 64000, "output": 8192 }
+    }
+  }
+}
+```
+
+Лимиты в примере — консервативный бюджет клиента, не обещание квоты веб-чата.
+Плагин `.opencode/plugin/deepseek-tool-discipline.js` поддерживает оба провайдера;
+обновите ранее установленную копию. Вызовы инструментов проходят через тот же
+строгий парсер `tool_calls`. Проверены живые ответы, продолжение диалога,
+headless-обновление входа и выполнение `read` из opencode на обеих моделях.
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.8-omni-flash","messages":[{"role":"user","content":"Hello"}]}'
+
+opencode run --model local-qwen/qwen3.8-max "Объясни этот проект"
+```
+
+Вход и профиль Qwen хранятся отдельно: `session/qwen/session.json` и
+`session/qwen/profile/`. Перед запросом сервер проверяет срок действия токена
+и при необходимости захватывает новый из сохранённого профиля без окна входа.
+После отказа авторизации выполняется одно обновление и повтор запроса.
+Если восстановить вход не удалось, при `SERVER_INTERACTIVE_LOGIN=0` вернётся
+`503 login_required`: выполните `python -m qwen.auth` и перезапустите сервер.
+`SESSION_REFRESH_INTERVAL` управляет только фоновым обновлением DeepSeek.
+
+Модели Flash и Max используют одну очередь аккаунта Qwen; очередь DeepSeek
+независима. `conversation_id` Qwen содержит префикс `qwen:` и исходную модель;
+диалог другого провайдера отвергается до обращения к аккаунту. Поддерживается
+текст: изображения, аудио и видео не загружаются, несмотря на имя Omni.
+Веб-протокол неофициальный и может измениться.
+
+---
+
 ## Переменные окружения
 
-Файл `.env` (копия `.env.example`):
+Файл `.env` в корне репозитория (копия `.env.example`) загружается до чтения
+настроек при запуске через `app.py`, `uvicorn`, `chat.py`, `deepseek.auth` и `qwen.auth`.
+Уже заданные переменные окружения имеют приоритет.
 
 | Переменная | По умолчанию | Назначение |
 | --- | --- | --- |
@@ -572,11 +652,13 @@ resp = client.chat.completions.create(
 | `PORT` | `8000` | Порт |
 | `RATE_LIMIT_PER_MINUTE` | `30` | Лимит запросов/мин на IP клиента (`/healthz` не считается) |
 | `DEEPSEEK_PROFILE_DIR` | — | Переиспользовать существующий профиль Chrome с активной сессией |
+| `QWEN_ENABLED` | `0` | Включить модели Qwen Chat на том же `/v1` |
+| `QWEN_PROFILE_DIR` | `session/qwen/profile` | Отдельный постоянный профиль Qwen Chat |
 | `SERVER_INTERACTIVE_LOGIN` | `1` | Открывать окно браузера при отсутствии сессии; `0` — отдавать `503` (для headless) |
-| `SESSION_REFRESH_ENABLED` | `1` | Фоновое обновление сессии |
+| `SESSION_REFRESH_ENABLED` | `1` | Фоновое обновление сессии DeepSeek |
 | `SESSION_REFRESH_INTERVAL` | `18000` (5 ч) | Интервал обновления, сек (меньше `SESSION_MAX_AGE` = 6 ч) |
 | `REFRESH_BROWSER_CHANNEL` | `chromium-headless-shell` | Канал Playwright для headless-обновления (меньше RAM) |
-| `REFRESH_BROWSER_CHANNEL_FALLBACK` | `chrome` | Запасной канал, если headless не читает cookies; пусто — отключить |
+| `REFRESH_BROWSER_CHANNEL_FALLBACK` | `chrome` | Запасной канал при отсутствии токена или ошибке headless-захвата; пусто — отключить |
 | `TOOLCALL_MAX_CONTINUATIONS` | `3` | Сколько раз допрашивать модель «продолжи», если tool call обрезан лимитом вывода |
 | `DEBUG_TOOLCALLS` | — | `1` — писать в лог сырой ответ модели, если вызов не распознан |
 
@@ -590,19 +672,22 @@ HOST=0.0.0.0 PORT=8080 RATE_LIMIT_PER_MINUTE=60 python app.py
 
 ## Ограничения и важные нюансы
 
-- **Сериализация запросов.** Один общий аккаунт, PoW-хранилище `wasmtime`
-  не реентерабельно, поэтому апстрим-вызовы выполняются **по одному**
-  (см. `server/api.py`). Параллельные запросы встают в очередь — не стоит
-  запускать несколько агентов/сессий одновременно.
+- **Сериализация запросов.** Сервер выполняет запросы общего аккаунта
+  **по одному для каждого провайдера**, включая стриминг, retry и continuation (см. `server/api.py`).
+  Ожидание очереди не занимает рабочие потоки. Прямой `DeepSeekClient` также
+  сериализует генерации внутри одного экземпляра. Используйте один процесс
+  сервера: несколько workers или отдельных клиентов не имеют общей очереди.
 - **Tool calling эмулируется.** Мост буферизует ответ и парсит его в tool
-  calls (`server/openai_format.py`, `parse_tool_calls`). Парсер терпим к прозе,
-  фенсам и XML/DSML DeepSeek, но это всё равно менее надёжно, чем нативный API:
-  возможны сбои на длинных многошаговых цепочках. Помогает плагин дисциплины и
-  `DEBUG_TOOLCALLS=1` для диагностики.
+  calls (`server/openai_format.py`, `parse_tool_calls`). Требуется один полный
+  блок `tool_calls`; другие формы не исполняются. Поддерживаются `auto`, `none`,
+  `required` и принудительный выбор объявленного инструмента. Невалидный
+  результат возвращается ошибкой, в SSE — событием `error` перед `[DONE]`.
+- **Обрыв ответа.** EOF без завершающего маркера и ошибки DeepSeek возвращаются
+  как ошибки; ограничение длины ответа передаётся как `finish_reason: "length"`.
 - **Нет реального подсчёта токенов.** `usage` — грубая оценка ~4 символа/токен.
 - **Большинство OpenAI-параметров игнорируется** (`temperature`, `top_p`,
   `max_tokens` и т.д.). Действуют только `model`, `messages`, `stream`,
-  `conversation_id`, `thinking`, `search`.
+  `conversation_id`, `thinking`, `search`, `tools`, `tool_choice`.
 - **Vision не поддерживается** (нет загрузки изображений).
 - **Идентификатор диалога.** `conversation_id` фиксирует модель при создании
   потока; при продолжении `model` игнорируется.
@@ -634,6 +719,16 @@ python -m deepseek.auth   # войдите заново
 
 ```bash
 pip install --upgrade wasmtime
+```
+
+На macOS Python 3.9 из Xcode может завершаться с `EXC_GUARD` при загрузке
+WASM, без Python traceback. В таком случае создайте новое окружение на
+отдельно установленном Python 3.12 и переустановите зависимости. Сохранённый
+вход в `session/` можно использовать повторно. Проверьте загрузку модуля
+до запуска сервера:
+
+```bash
+python -c "from deepseek.pow import DeepSeekPow; DeepSeekPow()"
 ```
 
 **Пустая headless-сессия (macOS, Chrome-профиль)**
@@ -679,7 +774,10 @@ PORT=8080 python app.py
 | Путь | Назначение |
 | --- | --- |
 | `app.py` | Точка входа — запускает сервер |
+| `settings.py` | Загрузка `.env` до чтения настроек |
 | `deepseek/` | Ядро: `DeepSeekClient`, вход (`auth.py`), HTTP-драйвер (`client.py`), PoW (`pow.py`) |
+| `qwen/` | Опциональный Qwen Chat: отдельный вход, HTTP API v2 и SSE |
+| `chat_protocol.py` | Общие границы SSE-событий и результат завершённого чата |
 | `server/` | FastAPI OpenAI-совместимый сервер (`api.py`, `config.py`, `openai_format.py` — парсер tool calls, `ratelimit.py`, `schemas.py`) |
 | `.opencode/plugin/` | Плагин дисциплины инструментов для opencode |
 | `examples/` | Запускаемые примеры (прямой Python и через сервер) |
@@ -687,6 +785,18 @@ PORT=8080 python app.py
 | `logs/` | Логи launchd-сервиса, **git-ignored** |
 | `.env.example` | Шаблон конфигурации |
 | `requirements.txt` | Python-зависимости |
+| `tests/` | Offline-регрессии: auth, tools, SSE, API, CLI и rate limit |
+
+Проверка без аккаунта DeepSeek и браузера:
+
+```bash
+python -m unittest discover -s tests -t . -v
+python -c "from deepseek.pow import DeepSeekPow; DeepSeekPow()"
+bash -n ds bin/ds-chat
+node --check .opencode/plugin/deepseek-tool-discipline.js
+```
+
+GitHub Actions запускает эти проверки на Python 3.9 и 3.12.
 
 ---
 
@@ -694,9 +804,19 @@ PORT=8080 python app.py
 
 - Всё в `session/` (cookies + bearer-токен) остаётся **на вашей машине** и
   исключено из git (`.gitignore`). Никогда не коммитьте `session/`.
+- На POSIX файлы сессии и состояния чата записываются атомарно с правами `0600`,
+  их каталоги и профиль браузера — `0700`. Для каждого провайдера сохраняются
+  только его cookies с ограничениями домена, пути, срока действия и HTTPS.
+- Старый кеш с cookies в виде словаря больше не используется: мост повторно
+  захватит сессию из профиля. Если это не удалось, выполните
+  `python -m deepseek.auth` и перезапустите сервер.
 - Пароли/секреты в `.env` не хранятся — вход выполняется вручную в браузере.
 - При `HOST=0.0.0.0` мост доступен в сети без аутентификации. Биндитесь только
   на `127.0.0.1` или закрывайте firewall'ом/прокси.
+- `app.py` не доверяет forwarded-заголовкам; rate limit использует адрес
+  соединения из ASGI. При запуске через uvicorn используйте
+  `--no-proxy-headers`. За доверенным reverse proxy разрешайте proxy headers
+  только для его IP через `--forwarded-allow-ips`; не задавайте `*`.
 - Не публикуйте `session/` и `.env` в публичных репозиториях.
 
 ---
