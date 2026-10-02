@@ -3,5 +3,13 @@
 # Install once:  mkdir -p ~/bin && ln -sf "$(pwd)/bin/ds-chat" ~/bin/ds-chat
 # (ensure ~/bin is on PATH, or add: alias ds-chat='~/bin/ds-chat')
 set -euo pipefail
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  SOURCE_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  if [[ "$SOURCE" != /* ]]; then
+    SOURCE="$SOURCE_DIR/$SOURCE"
+  fi
+done
+ROOT="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 exec "$ROOT/ds" "$@"

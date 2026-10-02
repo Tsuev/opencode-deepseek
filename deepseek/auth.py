@@ -7,11 +7,11 @@ email/password form). It does not chat. We then capture the bearer token from
 `localStorage.userToken` plus the session cookies, and hand them to the
 pure-HTTP client in `deepseek.client`.
 
-A persistent Chromium profile means the human-check is a one-time thing: once
-you've signed in, later runs reuse the profile and capture the token headlessly.
+A persistent Chromium profile can retain manual sign-in. Session loading uses
+the local cache only by default; authentication cannot clear an account pause.
 
     from deepseek.auth import get_session
-    session = get_session()          # logs in (visible) the first time, else headless
+    session = get_session()          # cached only; use python -m deepseek.auth to sign in
     print(session.token[:8], "...")
 """
 
@@ -19,10 +19,16 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
+import threading
 import time
 from dataclasses import dataclass, asdict
+from functools import wraps
+from http.cookiejar import Cookie, CookieJar
 from pathlib import Path
-from typing import Dict, Optional
+from typing import ClassVar, Optional
+
+from settings import ROOT
 
 # Default Playwright browser channel. "chrome" uses the installed Google Chrome
 # (needed to read a profile it created, e.g. cookies encrypted with Chrome's
@@ -30,9 +36,8 @@ from typing import Dict, Optional
 # "chromium-headless-shell" for the light headless shell.
 DEFAULT_CHANNEL: Optional[str] = "chrome"
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import Error as PlaywrightError, sync_playwright
 
-ROOT = Path(__file__).resolve().parent.parent
 # Override with DEEPSEEK_PROFILE_DIR to reuse an existing signed-in Chrome profile.
 DEFAULT_PROFILE_DIR = Path(os.getenv("DEEPSEEK_PROFILE_DIR", ROOT / "session" / "profile"))
 DEFAULT_SESSION_FILE = ROOT / "session" / "session.json"
@@ -40,15 +45,48 @@ DEFAULT_SESSION_FILE = ROOT / "session" / "session.json"
 CHAT_URL = "https://chat.deepseek.com/"
 SIGNIN_URL = "https://chat.deepseek.com/sign_in"
 
-LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled"]
-# Token is trusted for this long before we refresh it from the browser again.
+LAUNCH_ARGS = []
+# Maximum trusted cache age; expiry requires manual sign-in in the API.
 SESSION_MAX_AGE = 6 * 60 * 60  # 6 hours
+_PROFILE_LOCK = threading.RLock()
+
+
+def _serialize_profile(function):
+    @wraps(function)
+    def locked(*args, **kwargs):
+        with _PROFILE_LOCK:
+            return function(*args, **kwargs)
+    return locked
+
+
+def write_private_json(path: Path, data: dict) -> None:
+    """Atomically replace a private state file without exposing a partial write."""
+    path = Path(path)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            json.dump(data, output, indent=2, ensure_ascii=False)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _deepseek_cookie(cookie: dict) -> bool:
+    domain = cookie.get("domain", "").lower().lstrip(".")
+    return domain in ("deepseek.com", "chat.deepseek.com")
 
 
 class LoginRequired(RuntimeError):
     """Raised when no usable session exists and interactive login is disallowed
     (e.g. inside the server, where we can't pop open a browser mid-request).
     The message tells the user how to log in."""
+
+    before_dispatch = True
 
     DEFAULT = (
         "No DeepSeek session found. Log in first by running:\n"
@@ -65,8 +103,9 @@ class LoginRequired(RuntimeError):
 class Session:
     """A captured signed-in DeepSeek session."""
 
+    COOKIE_DOMAINS: ClassVar[tuple[str, ...]] = ("deepseek.com", "chat.deepseek.com")
     token: str
-    cookies: Dict[str, str]
+    cookies: list[dict]
     user_agent: str
     captured_at: float
 
@@ -75,15 +114,47 @@ class Session:
         return time.time() - self.captured_at
 
     def save(self, path: Path = DEFAULT_SESSION_FILE) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+        write_private_json(path, asdict(self))
+
+    def cookie_jar(self) -> CookieJar:
+        """Keep domain, path, expiry and secure restrictions in HTTP requests."""
+        if not isinstance(self.cookies, list):
+            raise LoginRequired("Legacy session cookies have no domain information. "
+                                "Run python -m deepseek.auth to capture a new session.")
+        jar = CookieJar()
+        for cookie in self.cookies:
+            if cookie.get("domain", "").lower().lstrip(".") not in self.COOKIE_DOMAINS:
+                continue
+            domain = cookie["domain"]
+            expires = cookie.get("expires", -1)
+            expires = int(expires) if expires > 0 else None
+            jar.set_cookie(Cookie(
+                version=0, name=cookie["name"], value=cookie["value"],
+                port=None, port_specified=False,
+                domain=domain, domain_specified=domain.startswith("."),
+                domain_initial_dot=domain.startswith("."),
+                path=cookie.get("path", "/"), path_specified=True,
+                secure=bool(cookie.get("secure", False)), expires=expires,
+                discard=expires is None, comment=None, comment_url=None,
+                rest={"HttpOnly": None} if cookie.get("httpOnly") else {},
+            ))
+        return jar
 
     @classmethod
     def load(cls, path: Path = DEFAULT_SESSION_FILE) -> Optional["Session"]:
         if not path.exists():
             return None
         try:
-            return cls(**json.loads(path.read_text(encoding="utf-8")))
+            path.parent.chmod(0o700)
+            path.chmod(0o600)
+            data = json.loads(path.read_text(encoding="utf-8"))
+            # Old caches lost domain/path information; recapture instead of
+            # forwarding potentially unrelated cookies from those caches.
+            if not isinstance(data.get("cookies"), list):
+                return None
+            session = cls(**data)
+            session.cookie_jar()
+            return session
         except Exception:
             return None
 
@@ -123,7 +194,7 @@ def _capture_from_context(context, page) -> Optional[Session]:
     token = _safe_evaluate(page, _READ_TOKEN_JS)
     if not token:
         return None
-    cookies = {c["name"]: c["value"] for c in context.cookies()}
+    cookies = [c for c in context.cookies([CHAT_URL]) if _deepseek_cookie(c)]
     ua = _safe_evaluate(page, "() => navigator.userAgent") or ""
     return Session(token=token, cookies=cookies, user_agent=ua, captured_at=time.time())
 
@@ -151,12 +222,15 @@ def _launch_context(p, profile_dir: Path, headless: bool, channel: Optional[str]
     fall back to the bundled browser rather than failing outright.
     """
     profile_dir.mkdir(parents=True, exist_ok=True)
+    profile_dir.chmod(0o700)
     kwargs: dict = {"headless": headless, "args": LAUNCH_ARGS}
     if channel:
         kwargs["channel"] = channel
     try:
         return p.chromium.launch_persistent_context(str(profile_dir), **kwargs)
-    except Exception:
+    except PlaywrightError:
+        if not channel:
+            raise
         kwargs.pop("channel", None)
         return p.chromium.launch_persistent_context(str(profile_dir), **kwargs)
 
@@ -175,11 +249,13 @@ def _safe_goto(page, url: str) -> None:
     page.wait_for_timeout(2000)
 
 
+@_serialize_profile
 def login(
     profile_dir: Path = DEFAULT_PROFILE_DIR,
     headless: bool = False,
     assume_logged_out: bool = False,
     channel: Optional[str] = DEFAULT_CHANNEL,
+    session_file: Path = DEFAULT_SESSION_FILE,
 ) -> Session:
     """Interactive login. Opens a visible window and waits for you to sign in by
     hand (and clear the AWS WAF human-check); once a token appears it captures
@@ -195,35 +271,34 @@ def login(
         context = _launch_context(p, profile_dir, headless, channel)
         page = context.pages[0] if context.pages else context.new_page()
 
-        # Normally we first land on CHAT_URL to reuse an already-signed-in
-        # profile. When the caller already knows we're logged out, skip straight
-        # to the sign-in page so the window doesn't appear to "refresh".
-        existing = None
-        if not assume_logged_out:
-            _safe_goto(page, CHAT_URL)
-            existing = page.evaluate(_READ_TOKEN_JS)
+        try:
+            existing = None
+            if not assume_logged_out:
+                _safe_goto(page, CHAT_URL)
+                existing = _safe_evaluate(page, _READ_TOKEN_JS)
 
-        if not existing:
-            _safe_goto(page, SIGNIN_URL)
-            print("[auth] Please sign in in the window (solve the human-check if "
-                  "shown). Waiting for the session...")
-            if not _wait_for_token(page, timeout=300):
-                context.close()
-                raise RuntimeError("Login timed out — no token captured.")
+            if not existing:
+                _safe_goto(page, SIGNIN_URL)
+                print("[auth] Please sign in in the window (solve the human-check if "
+                      "shown). Waiting for the session...")
+                if not _wait_for_token(page, timeout=300):
+                    raise RuntimeError("Login timed out — no token captured.")
 
-        session = _capture_from_context(context, page)
-        context.close()
+            session = _capture_from_context(context, page)
+        finally:
+            context.close()
         if session is None:
             raise RuntimeError("Logged in but could not read the token.")
-        session.save()
+        session.save(session_file)
         return session
 
 
+@_serialize_profile
 def _headless_refresh(
     profile_dir: Path, channel: Optional[str] = DEFAULT_CHANNEL
 ) -> Optional[Session]:
     """Try to capture a token headlessly from the persistent profile. Returns a
-    saved Session if the profile is still signed in, else None. Never opens a
+    Session if the profile is still signed in, else None. Never opens a
     visible window."""
     profile_dir.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as p:
@@ -235,53 +310,63 @@ def _headless_refresh(
         finally:
             context.close()
 
-    if session is not None:
-        session.save()
     return session
 
 
+@_serialize_profile
 def get_session(
     profile_dir: Path = DEFAULT_PROFILE_DIR,
     session_file: Path = DEFAULT_SESSION_FILE,
     max_age: int = SESSION_MAX_AGE,
-    allow_interactive: bool = True,
+    allow_interactive: bool = False,
     channel: Optional[str] = DEFAULT_CHANNEL,
     fallback_channel: Optional[str] = None,
+    allow_refresh: bool = False,
 ) -> Session:
-    """Return a usable session: cached file if fresh, else a headless refresh
-    from the browser profile.
+    """Load a fresh cache without browser access by default.
 
-    If neither works and `allow_interactive` is True, open a visible window for
-    manual sign-in. If it's False (the server's case — we can't pop a browser
-    mid-request), raise `LoginRequired` telling the user to run the login step.
-
-    Note: this uses Playwright's *sync* API, so it must not be called from inside
-    an asyncio event loop — call it from a worker thread (e.g. run_in_threadpool)."""
+    Explicit library callers may opt into allow_refresh; the API server never
+    does. Use the auth CLI for manual sign-in. Never use sign-in to clear a
+    provider pause or retry an account/security restriction.
+    """
     cached = Session.load(session_file)
     if cached and cached.age < max_age:
         return cached
 
+    # Requests must not reopen a website, recapture a session, or fall back to
+    # interactive login. The auth CLI is the explicit manual sign-in path.
+    if not allow_refresh:
+        raise LoginRequired()
+
     # Try a headless refresh from the (presumably logged-in) persistent profile.
-    session = _headless_refresh(profile_dir, channel)
-    if session is None and fallback_channel and fallback_channel != channel:
-        # The preferred (lighter) channel couldn't read the profile — e.g. a
-        # headless shell can't decrypt Chrome-encrypted cookies. Retry with the
-        # profile's native browser.
-        session = _headless_refresh(profile_dir, fallback_channel)
-    if session is not None:
-        return session
+    channels = [channel]
+    if fallback_channel and fallback_channel != channel:
+        channels.append(fallback_channel)
+    last_error = None
+    for browser_channel in channels:
+        try:
+            session = _headless_refresh(profile_dir, browser_channel)
+        except (PlaywrightError, OSError, RuntimeError) as exc:
+            last_error = exc
+            print(f"[auth] headless capture failed ({type(exc).__name__}); "
+                  "trying the next configured channel.")
+            continue
+        if session is not None:
+            session.save(session_file)
+            return session
 
     if not allow_interactive:
-        raise LoginRequired()
+        raise LoginRequired() from last_error
 
     # Not logged in yet — open a visible window so the user can sign in (and
     # clear the human-check) by hand. The persistent profile means this only
     # happens once — later calls capture the token headlessly. We just confirmed
     # (above) there's no token, so go straight to the sign-in page.
     print("[auth] No valid session found — opening a browser window to log in...")
-    return login(profile_dir=profile_dir, assume_logged_out=True, channel=channel)
+    return login(profile_dir=profile_dir, assume_logged_out=True, channel=channel,
+                 session_file=session_file)
 
 
 if __name__ == "__main__":
     s = login()
-    print(f"[auth] captured token {s.token[:10]}... ({len(s.cookies)} cookies)")
+    print(f"[auth] session saved to {DEFAULT_SESSION_FILE} ({len(s.cookies)} cookies)")

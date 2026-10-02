@@ -1,709 +1,227 @@
-# Full Free DeepSeek API → opencode (агент)
+<p align="center">
+  <img src="docs/media/bridge-hero.svg" alt="OpenCode Web Bridge — ваши AI-аккаунты, один локальный API" width="100%">
+</p>
 
-Локальный **OpenAI-совместимый мост** к бесплатному веб-чату DeepSeek
-([chat.deepseek.com](https://chat.deepseek.com)), который можно подключить к
-**opencode** как обычного провайдера моделей и использовать как полноценного
-агента (чтение/правка файлов, bash, поиск по коду и т.д.) — **без API-ключа и
-оплаты**.
+<p align="center">
+  <a href="README.en.md">English</a> ·
+  <a href="#быстрый-старт">Начать</a> ·
+  <a href="#что-работает">Провайдеры</a> ·
+  <a href="#в-opencode">Демонстрации</a> ·
+  <a href="docs/SETUP.ru.md">Полная инструкция</a>
+</p>
 
-> **English version:** [README.en.md](README.en.md)
+# Ваши AI-аккаунты — в OpenCode
 
-> **Оригинал проекта:** <https://github.com/sums001/Deepseek-API>
-> Это неофициальный проект, не связанный с DeepSeek. Вы используете свой
-> обычный аккаунт DeepSeek и несёте ответственность за соблюдение его условий.
+Локальный мост подключает веб-чаты **DeepSeek, Qwen, GLM и Kimi** к OpenCode
+через OpenAI-совместимый API. Вы входите в свой аккаунт, выбираете модель и
+работаете с файлами проекта в привычном агенте. Отдельный ключ API провайдера
+для этих подключений не нужен.
 
----
+**Экспериментальные адаптеры включаются отдельно. Перед запуском прочитайте
+ограничения аккаунтов и настройки безопасного отказа ниже.**
 
-## Содержание
+[![Проверки main](https://github.com/Tsuev/opencode-deepseek/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/Tsuev/opencode-deepseek/actions/workflows/tests.yml)
 
-- [Как это работает](#как-это-работает)
-- [Требования](#требования)
-- [Единый путь развёртки (копировать целиком)](#единый-путь-развёртки-копировать-целиком)
-- [Пошагово, с пояснениями](#пошагово-с-пояснениями)
-- [Проверка работоспособности](#проверка-работоспособности)
-- [Куда слать запросы: URL и API-ключ](#куда-слать-запросы-url-и-api-ключ)
-- [Чат в терминале](#чат-в-терминале)
-- [Интеграция с opencode](#интеграция-с-opencode)
-- [Переключение моделей, DeepThink и веб-поиск](#переключение-моделей-deepthink-и-веб-поиск)
-- [Переменные окружения](#переменные-окружения)
-- [Ограничения и важные нюансы](#ограничения-и-важные-нюансы)
-- [Обслуживание и troubleshooting](#обслуживание-и-troubleshooting)
-- [Структура проекта](#структура-проекта)
-- [Безопасность](#безопасность)
-- [Лицензия](#лицензия)
+> Бесплатный веб-чат расходует **лимиты вашего аккаунта**. Это не безлимитный
+> API: каждый ход агента, включая возврат результата инструмента, может
+> потребовать нового сообщения. [Квоты и ограничения](#лимиты-и-границы).
 
----
+> Автоматизация обычного веб-чата может привести к ограничению аккаунта.
+> Наш аккаунт DeepSeek заблокирован до 4 октября 2026, 22:17 по сообщению сайта;
+> точная причина не установлена. Сохранённые демонстрации относятся к версии
+> до защитных исправлений; живую проверку на заблокированном аккаунте не повторяли.
 
-## Как это работает
+Сервер больше не обновляет вход в фоне и не повторяет отказавшие запросы.
+Блокировка, квота, защитный отказ или неопределённый результат сохраняют паузу
+провайдера даже после перезапуска. Ответ — `403` с `retryable: false`; если SSE
+уже начался, ошибка приходит событием, а следующая попытка получит `403` до
+обращения к аккаунту. Между запросами и продолжениями — минимум 10 секунд
+по умолчанию; это не гарантия соблюдения квот или правил сайта.
 
-```
-┌──────────────┐   OpenAI API    ┌──────────────────────┐   внутренний   ┌──────────────────┐
-│   opencode   │ ───────────────▶│  server/api.py       │ ── протокол ──▶│  chat.deepseek   │
-│ (агент/CLI)  │  localhost:8000 │  (FastAPI, /v1/...)  │  + PoW/WASM    │  .com (ваш аккаунт)│
-└──────────────┘                 └──────────────────────┘                └──────────────────┘
-                                        │
-                                        ├── deepseek/auth.py   (вход через браузер, сессия в session/)
-                                        └── deepseek/pow.py    (решение proof-of-work через wasmtime)
-```
+Посмотреть паузы: `python -m providers.access status`. Возобновлять конкретного
+провайдера командой `python -m providers.access resume qwen` можно только после
+ручной проверки обычного сайта. Вход сам по себе паузу не снимает.
+В OpenCode задавайте `small_model` явно: генерация заголовков тоже расходует
+сообщения и не должна незаметно обращаться к другому аккаунту.
 
-- **opencode** думает, что общается с обычным OpenAI-провайдером.
-- **Мост** транслирует запросы в веб-чат DeepSeek, решает PoW-челлендж
-  (`sha3_wasm_bg.wasm` в песочнице `wasmtime`) и отдаёт поток токенов обратно.
-- Сессия входа сохраняется в `session/` (в git не попадает) и обновляется
-  автоматически примерно раз в 5 часов.
+## Что работает
 
----
+Состояние на **2 октября 2026**. «Проверено» означает живой ответ, продолжение
+диалога и выполнение `read` в OpenCode на контрольном файле. Это проверка
+конкретного аккаунта и сессии, а не гарантия любой будущей задачи.
 
-## Требования
+| Провайдер | Модели в локальном API | Состояние | Подключение |
+| --- | --- | --- | --- |
+| **DeepSeek** | `deepseek-chat` / `deepseek-expert` | Ранее проверено; текущий аккаунт получил `user is muted` | [Вход + сохранённая сессия](docs/SETUP.ru.md#4-вход-в-deepseek-один-раз) |
+| **Qwen** | `qwen3.8-omni-flash` / `qwen3.8-max` | Flash и Max проверены | [Отдельная сессия Qwen](docs/SETUP.ru.md#qwen-chat) |
+| **GLM / Z.ai** | `glm-web` | Проверено; в тесте GLM-5.3-Flash | [Ваша вкладка Safari](browser/README.md#safari) |
+| **Kimi** | `kimi-web` | Проверено, включая инструменты | [Ваша вкладка Safari](browser/README.md#safari) |
+| **Mistral / Vibe** | `mistral-web` | Один ответ прошёл; продолжение — `429`. Агент не проверен | Эксперимент, выключен по умолчанию |
+| **Grok** | `grok-web` | Сайт отвечает; мост не захватывает завершённый ответ | Эксперимент, выключен по умолчанию |
+| **Gemini** | Задаются из `agy models` | Вход прошёл; запрос отклонён по региону | [Официальный Antigravity CLI](browser/README.md#gemini), выключен |
 
-- **Python 3.9+** (рекомендуется 3.11/3.12)
-- **Node.js 18+** — нужен только для opencode (не для моста)
-- **Аккаунт DeepSeek** (бесплатный, тот же, что для chat.deepseek.com)
-- **opencode** — <https://opencode.ai>
-- ОС: Windows, macOS, Linux
+У `glm-web` и `kimi-web` модель выбирается **на сайте**. Эти имена не обещают
+версию или тариф. **Все провайдеры выключены после чистой установки**, включая
+DeepSeek. Включайте только выбранное подключение.
 
----
+## В OpenCode
 
-## Единый путь развёртки (копировать целиком)
+Настоящие кадры OpenCode **1.18.34**: агент `plan` читает маленький `hello.py`
+и возвращает его результат. Для демонстраций используется отдельная папка;
+личных файлов и данных аккаунтов в кадрах нет.
 
-> Ниже — весь путь от нуля до работающего агента. Выполняйте блоки по порядку.
-> Замените `~/projects` на удобную вам папку.
+| Qwen3.8 Omni Flash | Qwen3.8 Max |
+| --- | --- |
+| ![OpenCode с Qwen Flash](docs/media/qwen-flash-opencode.png) | ![OpenCode с Qwen Max](docs/media/qwen-max-opencode.png) |
 
-### macOS / Linux
+| GLM · модель выбрана в Safari | Kimi · модель выбрана в Safari |
+| --- | --- |
+| ![OpenCode с GLM](docs/media/glm-opencode.png) | ![OpenCode с Kimi](docs/media/kimi-opencode.png) |
+
+Нажмите на изображение, чтобы рассмотреть полный кадр.
+[Как записаны демонстрации](docs/media/README.md). Свежая запись DeepSeek остановлена
+отказом аккаунта `user is muted`; успешный кадр не подменяется старым. Для
+Mistral, Grok и Gemini успешных демонстраций агента тоже пока нет.
+
+## Быстрый старт
+
+Понадобятся **Python 3.9+** (рекомендуем 3.12), Git, аккаунт Qwen и
+[установленный OpenCode](https://opencode.ai/docs/). Сам мост не требует Node.js.
+Ниже — первая установка на macOS/Linux; [Windows и подробности](docs/SETUP.ru.md).
+
+**1. Установите мост из репозитория.**
 
 ```bash
-# 0. Предпосылки: Python 3.9+, Node 18+, opencode
-python3 --version && node --version && opencode --version
-
-# 1. Клон проекта
-mkdir -p ~/projects && cd ~/projects
 git clone https://github.com/Tsuev/opencode-deepseek.git
 cd opencode-deepseek
-
-# 2. Виртуальное окружение
 python3 -m venv venv
 source venv/bin/activate
-
-# 3. Зависимости + браузер для Playwright
-pip install --upgrade pip
-pip install -r requirements.txt
-playwright install chromium
-
-# 4. Одноразовый вход в аккаунт DeepSeek (откроется окно браузера)
-python -m deepseek.auth
-
-# 5. Конфиг (значения по умолчанию подходят для локального запуска)
+python -m pip install -r requirements.txt
+python -m playwright install chromium
 cp .env.example .env
-
-# 6. Запуск сервера (оставьте терминал открытым)
-python app.py
-# -> http://127.0.0.1:8000
 ```
 
-Проверка (во **втором** терминале):
+**2. Войдите в Qwen и включите его.**
+
+```bash
+python -m qwen.auth
+```
+
+В `.env` замените `QWEN_ENABLED=0` на `QWEN_ENABLED=1`, затем:
+
+```bash
+python app.py
+```
+
+Вход выполните сами в открытом браузере. Сервер оставьте работающим.
+Во втором терминале проверьте:
 
 ```bash
 curl http://127.0.0.1:8000/healthz
 curl http://127.0.0.1:8000/v1/models
 ```
 
-### Windows (PowerShell)
+**3. Подключите OpenCode в своём проекте.**
 
-```powershell
-python --version; node --version; opencode --version
-
-mkdir $HOME\projects; cd $HOME\projects
-git clone https://github.com/Tsuev/opencode-deepseek.git
-cd opencode-deepseek
-
-python -m venv venv
-.\venv\Scripts\Activate.ps1
-
-pip install --upgrade pip
-pip install -r requirements.txt
-playwright install chromium
-
-python -m deepseek.auth
-Copy-Item .env.example .env
-python app.py
-```
-
-> Если PowerShell блокирует активацию venv:
-> `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
-> (или активируйте через `venv\Scripts\activate.bat` в `cmd.exe`).
-
-### Регистрация провайдера и агента в opencode
-
-Содержимое файлов `opencode.json` и `.opencode/agent/*.md` — в разделе
-[Интеграция с opencode](#интеграция-с-opencode). После их создания
-**перезапустите opencode**.
-
----
-
-## Пошагово, с пояснениями
-
-### 1. Клон
+Возьмите [готовый `opencode.json`](examples/opencode.json) и поместите его
+в папку проекта. Если конфиг уже есть, объедините объекты `provider`, сохранив
+свои настройки. Порт по умолчанию — `8000`, `baseURL` —
+`http://127.0.0.1:8000/v1`; `apiKey: "unused"` — заглушка для SDK.
+Поля `limit` в примере задают консервативные бюджеты клиента; это не
+спецификация контекста модели и не квота аккаунта.
 
 ```bash
-git clone https://github.com/Tsuev/opencode-deepseek.git
-cd opencode-deepseek
+cd /path/to/your-project
+opencode --agent plan --model local-qwen/qwen3.8-omni-flash
 ```
 
-### 2. Виртуальное окружение
-
-Изолирует зависимости проекта от системного Python.
-
-```bash
-python3 -m venv venv
-source venv/bin/activate        # macOS/Linux
-# .\venv\Scripts\Activate.ps1   # Windows PowerShell
-```
-
-### 3. Зависимости
-
-```bash
-pip install -r requirements.txt
-playwright install chromium     # разовая установка браузера
-```
-
-`requirements.txt` тянет: `playwright` (вход + PoW), `httpx`, `fastapi`,
-`uvicorn`, `pydantic`, `python-dotenv`, `wasmtime`, `openai`.
-
-### 4. Вход в DeepSeek (один раз)
-
-```bash
-python -m deepseek.auth
-```
-
-Откроется настоящий браузер — войдите в аккаунт и пройдите капчу
-(human-check). После этого токен и cookies сохранятся в `session/` и будут
-переиспользоваться. Сессия обновляется автоматически; повторный вход нужен,
-только если она полностью истекла.
-
-### 5. Конфигурация `.env`
-
-```bash
-cp .env.example .env
-```
-
-Для локального запуска значения по умолчанию подходят. Пароли в `.env` не
-хранятся — вход выполняется вручную в браузере.
-
-### 6. Запуск сервера
-
-```bash
-python app.py
-# -> DeepSeek OpenAI-compatible API on http://127.0.0.1:8000
-```
-
-Альтернатива через uvicorn с другим адресом:
-
-```bash
-HOST=0.0.0.0 PORT=8080 python app.py
-# или
-uvicorn server.api:app --host 0.0.0.0 --port 8080
-```
-
-### 7. Автозапуск при входе в систему (macOS, опционально)
-
-Чтобы сервер поднимался сам и перезапускался при падении, заведите LaunchAgent
-`~/Library/LaunchAgents/com.deepseek.api.plist`:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key><string>com.deepseek.api</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/Users/ВЫ/root/other/Deepseek-API/venv/bin/python</string>
-        <string>app.py</string>
-    </array>
-    <key>WorkingDirectory</key><string>/Users/ВЫ/root/other/Deepseek-API</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>HOST</key><string>127.0.0.1</string>
-        <key>PORT</key><string>8000</string>
-    </dict>
-    <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><true/>
-    <key>StandardOutPath</key><string>/Users/ВЫ/root/other/Deepseek-API/logs/server.log</string>
-    <key>StandardErrorPath</key><string>/Users/ВЫ/root/other/Deepseek-API/logs/server.err</string>
-</dict>
-</plist>
-```
-
-```bash
-mkdir -p logs
-launchctl load  ~/Library/LaunchAgents/com.deepseek.api.plist   # включить
-launchctl kickstart -k "gui/$(id -u)/com.deepseek.api"          # перезапуск после правок кода
-launchctl unload ~/Library/LaunchAgents/com.deepseek.api.plist  # выключить
-```
-
-> Важно: при `reload=False` (как в `app.py`) изменения кода подхватываются
-> только после перезапуска — используйте `kickstart -k`. Логи смотрите в
-> `logs/server.log` и `logs/server.err`.
-
----
-
-## Проверка работоспособности
-
-```bash
-# 1) Живость
-curl http://127.0.0.1:8000/healthz
-# {"status":"ok"}
-
-# 2) Список моделей
-curl http://127.0.0.1:8000/v1/models
-
-# 3) Простой чат
-curl http://127.0.0.1:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"Привет!"}]}'
-```
-
-Python SDK:
-
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
-r = client.chat.completions.create(
-    model="deepseek-chat",
-    messages=[{"role": "user", "content": "Hello!"}],
-)
-print(r.choices[0].message.content)
-```
-
-Готовые примеры: [examples/](examples/) (`01_*` — напрямую из Python, `04_*`–`06_*` — через сервер).
-
----
-
-## Куда слать запросы: URL и API-ключ
-
-Базовый адрес — `http://localhost:8000/v1` (или `http://127.0.0.1:8000/v1`).
-Порт меняется переменной `PORT` в `.env` / launchd.
-
-| Метод | URL | Назначение |
-| --- | --- | --- |
-| `POST` | `http://localhost:8000/v1/chat/completions` | Чат; стриминг через `"stream": true` |
-| `GET` | `http://localhost:8000/v1/models` | Список моделей (`deepseek-chat`, `deepseek-expert`) |
-| `GET` | `http://localhost:8000/healthz` | Проверка живости (без рейт-лимита) |
-
-**API-ключ:** любой. Мост **не проверяет** `Authorization` и не читает его
-(`server/api.py` не смотрит заголовок), поэтому в SDK, где ключ обязателен
-синтаксически, пишут заглушку — исторически `api_key="unused"`. В чистом HTTP
-через `curl` заголовок `Authorization` вообще не нужен.
-
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
-```
-
-```bash
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"Hi"}]}'
-```
-
-Нестандартные поля (вне схемы OpenAI) передаются через `extra_body`:
-`thinking` (DeepThink), `search` (веб-поиск), `conversation_id` (продолжить
-диалог; при resume модель игнорируется). Лимит — `RATE_LIMIT_PER_MINUTE`
-(по умолчанию 30/мин на IP), `/healthz` не считается.
-
----
-
-## Чат в терминале
-
-`chat.py` — интерактивный REPL, который ходит в chat.deepseek.com напрямую
-через `DeepSeekClient`. Сервер (`app.py`) для этого не нужен.
-
-```bash
-./ds                      # продолжить последний диалог
-./ds --new                # начать новый диалог
-./ds --model expert       # Expert — сильнее и медленнее, чем Instant
-./ds --think --search     # DeepThink-размышление + веб-поиск
-./ds --no-think           # выключить DeepThink для этого запуска
-```
-
-Внутри чата:
-
-| Команда | Что делает |
-| --- | --- |
-| `/new` | новый диалог (история на сайте сохраняется) |
-| `/model default` \| `/model expert` | сменить модель (модель фиксируется при создании треда, поэтому смена открывает новый диалог) |
-| `/think` | переключить DeepThink |
-| `/search` | переключить веб-поиск |
-| `/status` | текущая модель и переключатели |
-| `/exit` | выйти (работает и Ctrl-D) |
-
-Ответ печатается по мере генерации. Строка, заканчивающаяся на `\`, продолжается
-на следующей. Текущий диалог и настройки сохраняются в `session/chat_state.json`,
-так что следующий запуск `./ds` его продолжит.
-
-Запуск из любой директории — поставьте shim один раз:
-
-```bash
-mkdir -p ~/bin && ln -sf "$(pwd)/bin/ds-chat" ~/bin/ds-chat
-# убедитесь, что ~/bin в PATH
-```
-
-Вариант `Command+L` прямо в терминале Kaku — в
-**[docs/TERMINAL_CHAT.md](docs/TERMINAL_CHAT.md)**.
-
-Демонстрация `Command+L` в Kaku (25 секунд):
-
-[![Command+L в Kaku — чат DeepSeek](docs/media/kaku-ai.png)](docs/media/kaku-ai.mp4)
-
-Видео: [`docs/media/kaku-ai.mp4`](docs/media/kaku-ai.mp4) — H.264/AAC,
-1276×992, 1.4 МБ. Превью: `docs/media/kaku-ai.png` (нажмите на картинку, чтобы
-открыть видео).
-
----
-
-## Интеграция с opencode
-
-opencode подключается к мосту как к **OpenAI-совместимому провайдеру**.
-
-### 1. Провайдер в `opencode.json`
-
-Создайте `opencode.json` в корне вашего рабочего проекта (или в
-`~/.config/opencode/opencode.json` для глобальной настройки):
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "local-deepseek": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "DeepSeek (local bridge)",
-      "options": {
-        "baseURL": "http://127.0.0.1:8000/v1",
-        "apiKey": "unused"
-      },
-      "models": {
-        "deepseek-chat": {
-          "name": "DeepSeek Chat (Instant)",
-          "tool_call": true,
-          "reasoning": false,
-          "limit": { "context": 64000, "output": 8192 }
-        },
-        "deepseek-expert": {
-          "name": "DeepSeek Expert",
-          "tool_call": true,
-          "reasoning": false,
-          "limit": { "context": 64000, "output": 8192 }
-        }
-      }
-    }
-  }
-}
-```
-
-- `npm: "@ai-sdk/openai-compatible"` — универсальный OpenAI-совместимый драйвер.
-- `apiKey` обязателен для SDK, но мост его игнорирует.
-- `model` в opencode указывается как `local-deepseek/deepseek-chat` или
-  `local-deepseek/deepseek-expert`.
-- `limit.context` — приблизительный; уменьшите, если получаете ошибки о
-  переполнении контекста.
-
-### 2. (Опционально) Сделать DeepSeek моделью по умолчанию
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "model": "local-deepseek/deepseek-chat",
-  "small_model": "local-deepseek/deepseek-chat",
-  "provider": { "local-deepseek": { "npm": "@ai-sdk/openai-compatible", "name": "DeepSeek (local bridge)", "options": { "baseURL": "http://127.0.0.1:8000/v1", "apiKey": "unused" }, "models": { "deepseek-chat": { "name": "DeepSeek Chat (Instant)", "tool_call": true }, "deepseek-expert": { "name": "DeepSeek Expert", "tool_call": true } } } }
-}
-```
-
-> `small_model` используется для служебных задач (генерация заголовков и т.п.).
-
-### 3. Агент
-
-Файл `.opencode/agent/deepseek.md` в корне рабочего проекта:
-
-```markdown
----
-description: Инженерный агент на DeepSeek через локальный мост
-mode: primary
-model: local-deepseek/deepseek-expert
-temperature: 0.3
-permission:
-  edit: allow
-  webfetch: allow
-  bash:
-    "git *": allow
-    "*": ask
----
-
-Ты — аккуратный инженерный агент. Сначала изучаешь код, затем предлагаешь
-минимальные точечные правки. Не добавляешь комментарии без просьбы. После
-изменений запускаешь линтер и тесты проекта, если они есть.
-```
-
-- `mode: primary` — агент доступен как основной (переключается в TUI/через
-  `default_agent`). Для вспомогательного агента используйте `mode: subagent`.
-- Тело файла — это системный промпт агента.
-
-Чтобы назначить его агентом по умолчанию, добавьте в `opencode.json`:
-
-```json
-{ "default_agent": "deepseek" }
-```
-
-### 4. Перезапуск
-
-opencode читает конфиг один раз при старте. **Полностью закройте и заново
-запустите opencode** после создания/правки `opencode.json` и файлов агентов.
-
-Проверка: в opencode откройте выбор модели — должны появиться
-`DeepSeek Chat (Instant)` и `DeepSeek Expert` под провайдером
-`DeepSeek (local bridge)`.
-
-### 5. Почему модель не вносит правки (эмуляция tool calling)
-
-У веб-чата DeepSeek **нет канала function calling**, поэтому мост эмулирует его
-текстом: подмешивает в промпт инструкцию «ответь ровно одним блоком
-```` ```tool_calls ```` JSON» и затем парсит ответ обратно
-([server/openai_format.py](server/openai_format.py)). Если модель пишет прозу
-вместо вызова, opencode просто печатает текст и **ничего не выполняет**.
-
-Что сделано для надёжности:
-
-- парсер принимает фенсы, JSON внутри прозы, а также нативный XML/DSML DeepSeek
-  (`<tool_call>`, `function<|tool_sep|>name`);
-- инструкция усилена (запрет прозы + пример + напоминание в конце);
-- плагин дисциплины добавляет позднюю системную инструкцию.
-
-Диагностика: запустите сервер с `DEBUG_TOOLCALLS=1` — при нераспознанном вызове
-в лог (`logs/server.log` или stdout) попадёт сырой ответ модели.
-
-```bash
-DEBUG_TOOLCALLS=1 python app.py
-```
-
-Проверить мост напрямую (без opencode):
-
-```bash
-curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" -d '{
-  "model": "deepseek-chat",
-  "messages": [{"role":"user","content":"Create a file /tmp/x.txt with hello"}],
-  "tools": [{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"filePath":{"type":"string"},"content":{"type":"string"}}}}}]
-}'
-```
-
-Успех — `"finish_reason": "tool_calls"` и заполненный `message.tool_calls`.
-
----
-
-## Переключение моделей, DeepThink и веб-поиск
-
-| Что | Значение в opencode | Примечание |
-| --- | --- | --- |
-| Быстрая модель | `local-deepseek/deepseek-chat` | По умолчанию |
-| Экспертная модель | `local-deepseek/deepseek-expert` | Сильнее, медленнее |
-| DeepThink (reasoning) | — | Через `extra_body`, см. ниже |
-| Веб-поиск | — | Через `extra_body`, см. ниже |
-
-Модель задаётся в opencode штатно (выбор модели или поле `model` в агенте).
-`thinking` (DeepThink) и `search` (веб-поиск) — это **не** модели, а
-дополнительные флаги тела запроса, которые opencode напрямую не передаёт.
-Их можно включить плагином (см. ниже) либо запросами через `curl`/SDK:
-
-```python
-resp = client.chat.completions.create(
-    model="deepseek-expert",
-    messages=[{"role": "user", "content": "Что нового в мире?"}],
-    extra_body={"thinking": True, "search": True},
-)
-```
-
-### Плагин дисциплины инструментов (важно для агента)
-
-Из-за эмуляции tool calling (см. выше) модель склонна «описывать» действие
-вместо вызова. Плагин добавляет позднюю системную инструкцию, требующую реальных
-tool calls. Файл авто-подхватывается opencode без правки конфига:
-
-- глобально: `~/.config/opencode/plugin/deepseek-tool-discipline.js`
-- в проекте: `.opencode/plugin/deepseek-tool-discipline.js` (лежит в репозитории)
-
-```js
-export const DeepSeekToolDiscipline = async () => ({
-  "experimental.chat.system.transform": async (input, output) => {
-    if (input?.model?.providerID !== "local-deepseek") return;
-    output.system.push(
-      "CRITICAL: to act you MUST emit real tool calls; never describe the " +
-      "action, never print JSON/XML or a tool_calls block as visible text."
-    );
-  },
-});
-```
-
-> Хуки `experimental.*` помечены экспериментальными (проверено на opencode
-> 1.18.x). Если их переименуют, плагин просто перестанет срабатывать и не
-> сломает запуск.
-
-### DeepThink и веб-поиск (опционально)
-
-`thinking`/`search` — нестандартные поля тела запроса; opencode их напрямую не
-передаёт. Их можно добавить хуком `chat.params` (`output.options.thinking =
-true`), но **не включайте reasoning по умолчанию** — он ухудшает соблюдение
-формата tool calls. Через `curl`/SDK они работают сразу:
-
-```python
-resp = client.chat.completions.create(
-    model="deepseek-expert",
-    messages=[{"role": "user", "content": "Что нового в мире?"}],
-    extra_body={"thinking": True, "search": True},
-)
-```
-
----
-
-## Переменные окружения
-
-Файл `.env` (копия `.env.example`):
-
-| Переменная | По умолчанию | Назначение |
-| --- | --- | --- |
-| `HOST` | `127.0.0.1` | Адрес прослушивания |
-| `PORT` | `8000` | Порт |
-| `RATE_LIMIT_PER_MINUTE` | `30` | Лимит запросов/мин на IP клиента (`/healthz` не считается) |
-| `DEEPSEEK_PROFILE_DIR` | — | Переиспользовать существующий профиль Chrome с активной сессией |
-| `SERVER_INTERACTIVE_LOGIN` | `1` | Открывать окно браузера при отсутствии сессии; `0` — отдавать `503` (для headless) |
-| `SESSION_REFRESH_ENABLED` | `1` | Фоновое обновление сессии |
-| `SESSION_REFRESH_INTERVAL` | `18000` (5 ч) | Интервал обновления, сек (меньше `SESSION_MAX_AGE` = 6 ч) |
-| `REFRESH_BROWSER_CHANNEL` | `chromium-headless-shell` | Канал Playwright для headless-обновления (меньше RAM) |
-| `REFRESH_BROWSER_CHANNEL_FALLBACK` | `chrome` | Запасной канал, если headless не читает cookies; пусто — отключить |
-| `TOOLCALL_MAX_CONTINUATIONS` | `3` | Сколько раз допрашивать модель «продолжи», если tool call обрезан лимитом вывода |
-| `DEBUG_TOOLCALLS` | — | `1` — писать в лог сырой ответ модели, если вызов не распознан |
-
-Пример:
-
-```bash
-HOST=0.0.0.0 PORT=8080 RATE_LIMIT_PER_MINUTE=60 python app.py
-```
-
----
-
-## Ограничения и важные нюансы
-
-- **Сериализация запросов.** Один общий аккаунт, PoW-хранилище `wasmtime`
-  не реентерабельно, поэтому апстрим-вызовы выполняются **по одному**
-  (см. `server/api.py`). Параллельные запросы встают в очередь — не стоит
-  запускать несколько агентов/сессий одновременно.
-- **Tool calling эмулируется.** Мост буферизует ответ и парсит его в tool
-  calls (`server/openai_format.py`, `parse_tool_calls`). Парсер терпим к прозе,
-  фенсам и XML/DSML DeepSeek, но это всё равно менее надёжно, чем нативный API:
-  возможны сбои на длинных многошаговых цепочках. Помогает плагин дисциплины и
-  `DEBUG_TOOLCALLS=1` для диагностики.
-- **Нет реального подсчёта токенов.** `usage` — грубая оценка ~4 символа/токен.
-- **Большинство OpenAI-параметров игнорируется** (`temperature`, `top_p`,
-  `max_tokens` и т.д.). Действуют только `model`, `messages`, `stream`,
-  `conversation_id`, `thinking`, `search`.
-- **Vision не поддерживается** (нет загрузки изображений).
-- **Идентификатор диалога.** `conversation_id` фиксирует модель при создании
-  потока; при продолжении `model` игнорируется.
-- **Лимит рейта.** При `429` используйте экспоненциальную задержку —
-  официальный `openai` SDK делает это автоматически.
-- **Не хаммерьте аккаунт.** Это ваш обычный аккаунт DeepSeek; массовые
-  автоматические запросы могут привести к блокировке.
-
----
-
-## Обслуживание и troubleshooting
-
-**Сессия истекла / `503 login_required`**
-
-```bash
-python -m deepseek.auth   # войдите заново
-```
-
-Убедитесь, что `SERVER_INTERACTIVE_LOGIN=0` на headless-деплое, а окно входа
-выполнено заранее.
-
-**`Playwright Sync API inside the asyncio loop`**
-
-Не вызывайте синхронный Playwright из event loop — мост уже оборачивает вызовы
-в `run_in_threadpool`. Такое сообщение обычно означает нестандартную
-модификацию кода.
-
-**Ошибки PoW / wasmtime**
-
-```bash
-pip install --upgrade wasmtime
-```
-
-**Пустая headless-сессия (macOS, Chrome-профиль)**
-
-По умолчанию фолбэк на `chrome`. Оставьте `REFRESH_BROWSER_CHANNEL_FALLBACK=chrome`
-или задайте `DEEPSEEK_PROFILE_DIR`.
-
-**`429 Too Many Requests`**
-
-Поднимите `RATE_LIMIT_PER_MINUTE` и/или добавьте ретраи с backoff.
-
-**Порт занят**
-
-```bash
-PORT=8080 python app.py
-```
-
-и укажите `http://127.0.0.1:8080/v1` в `baseURL` провайдера opencode.
-
-**Агент отвечает текстом, но файлы не меняет (нет tool calls)**
-
-1. В `opencode.json` у моделей должно быть `"tool_call": true`.
-2. Проверьте мост напрямую `curl`-запросом с `tools` (см.
-   [Интеграция с opencode](#интеграция-с-opencode)): должен вернуться
-   `"finish_reason": "tool_calls"` и непустой `message.tool_calls`.
-3. Поставьте плагин `deepseek-tool-discipline.js` (глобально или в проект).
-4. Запустите сервер с `DEBUG_TOOLCALLS=1` и изучите сырой ответ модели в логе.
-5. Увеличьте `steps` у агента и используйте `deepseek-expert`.
-
-**Правки кода не применились после редактирования (launchd)**
-
-Сервер под launchd с `reload=False` — перезапустите его:
-`launchctl kickstart -k "gui/$(id -u)/com.deepseek.api"`.
-
-**Изменения в `opencode.json`/агентах не применились**
-
-Перезапустите opencode — конфиг не перезагружается на лету.
-
----
-
-## Структура проекта
-
-| Путь | Назначение |
-| --- | --- |
-| `app.py` | Точка входа — запускает сервер |
-| `deepseek/` | Ядро: `DeepSeekClient`, вход (`auth.py`), HTTP-драйвер (`client.py`), PoW (`pow.py`) |
-| `server/` | FastAPI OpenAI-совместимый сервер (`api.py`, `config.py`, `openai_format.py` — парсер tool calls, `ratelimit.py`, `schemas.py`) |
-| `.opencode/plugin/` | Плагин дисциплины инструментов для opencode |
-| `examples/` | Запускаемые примеры (прямой Python и через сервер) |
-| `session/` | Сохранённая сессия (cookies + токен), **git-ignored** |
-| `logs/` | Логи launchd-сервиса, **git-ignored** |
-| `.env.example` | Шаблон конфигурации |
-| `requirements.txt` | Python-зависимости |
-
----
-
-## Безопасность
-
-- Всё в `session/` (cookies + bearer-токен) остаётся **на вашей машине** и
-  исключено из git (`.gitignore`). Никогда не коммитьте `session/`.
-- Пароли/секреты в `.env` не хранятся — вход выполняется вручную в браузере.
-- При `HOST=0.0.0.0` мост доступен в сети без аутентификации. Биндитесь только
-  на `127.0.0.1` или закрывайте firewall'ом/прокси.
-- Не публикуйте `session/` и `.env` в публичных репозиториях.
-
----
-
-## Лицензия
-
-[MIT License](LICENSE). Проект неофициальный; вы отвечаете за соблюдение
-условий использования DeepSeek.
-
-**Оригинал:** <https://github.com/sums001/Deepseek-API>
+Попросите прочитать файл и объяснить его. Переключиться к правкам можно штатным
+выбором агента в OpenCode. [Настройка агентов и плагина инструментов](docs/SETUP.ru.md#интеграция-с-opencode).
+
+**4. Добавьте нужные аккаунты.**
+
+- **Qwen Max:** после входа Qwen выберите `local-qwen/qwen3.8-max`.
+- **DeepSeek (риск ограничения аккаунта):** включите `DEEPSEEK_ENABLED=1`
+  в `.env` только осознанно, выполните `python -m deepseek.auth`, перезапустите
+  сервер и выберите `local-deepseek/deepseek-chat`
+  или `local-deepseek/deepseek-expert`. При отказе `user is muted` остановитесь:
+  повторный вход в нашем тесте его не устранил.
+- **GLM / Kimi:** установите Safari Userscripts и выполните
+  [подключение вкладки](browser/README.md#safari). В `.env` включите
+  `BROWSER_BRIDGE_ENABLED=1` и `GLM_ENABLED=1` / `KIMI_ENABLED=1`, перезапустите
+  сервер. Модели OpenCode — `local-glm/glm-web` / `local-kimi/kimi-web`.
+  Держите связанную вкладку открытой; закрытие или перезагрузка во время
+  запроса прерывает задачу.
+
+Не включайте экспериментальные адаптеры только потому, что они есть в коде.
+Сначала проверьте их текущий статус в таблице.
+
+## Как устроен мост
+
+![Архитектура: OpenCode выполняет инструменты локально; API направляет сообщения в сессии DeepSeek/Qwen, вкладки GLM/Kimi или официальный CLI](docs/media/bridge-architecture.svg)
+
+[Открыть схему целиком](docs/media/bridge-architecture.svg).
+
+**OpenCode выполняет инструменты на вашем компьютере.** Модель получает
+текст запроса и результаты разрешённых инструментов. Мост преобразует
+завершённый ответ в текст или проверенный `tool_calls`; незавершённые и
+некорректные вызовы не выдаются клиенту.
+
+**Подключения устроены по-разному.** DeepSeek и Qwen используют сохранённые
+локально сессии и HTTP-протокол веб-чата. GLM и Kimi отправляют сообщения через
+обычную вкладку Safari: Userscripts связывают её с локальной очередью. Вход
+остаётся в браузере. Gemini использует отдельный официальный CLI.
+
+Для браузерных адаптеров текст сначала проверяется на принадлежность запросу
+и завершение потока. SSE может передавать keepalive, пока готовится проверенный
+ответ; это не обещание посимвольного потока от любого провайдера.
+
+## Лимиты и границы
+
+- **Mistral Free ограничивает сообщения.** В нашей проверке квота остановила
+  продолжение после первого успешного ответа. [Тарифы Mistral](https://mistral.ai/pricing/).
+- **У Kimi есть ограничения частоты и нагрузки.** Китайский провайдер тоже не
+  означает безлимит. [Официальная справка](https://www.kimi.com/en/help/others/chat-issues).
+- **У DeepSeek, Qwen и GLM квота в наших тестах не исчерпалась.** Фиксированный
+  текущий лимит веб-чата мы не установили. Квоты платного API и CLI к этим
+  подключениям не относятся.
+- **DeepSeek сейчас отклонил наш аккаунт:** `biz_code=5`, `user is muted`.
+  Причина в ответе не указана. Это результат текущей проверки аккаунта,
+  а не доказательство общего запрета для всех пользователей.
+- **Сейчас поддерживается текст.** Изображения, аудио и видео мост не загружает,
+  даже если в названии модели есть Omni.
+- **Веб-протоколы могут меняться.** `429`, защитная проверка и региональный отказ
+  — повод остановиться и проверить обычный интерфейс аккаунта.
+
+[Полное описание ограничений](browser/README.md#usage-limits).
+Мост не переключает аккаунты для обхода квот и не предоставляет региональный доступ.
+
+## Что остаётся локально
+
+API по умолчанию слушает **`127.0.0.1`**. Сохранённые сессии находятся в
+`session/`, настройки — в `.env`; эти файлы исключены из Git. Персональные
+Userscripts содержат ключ связи с вашим мостом — не публикуйте их.
+
+Запросы и прочитанные агентом данные отправляются **выбранному провайдеру**.
+Локальный мост не делает облачную модель локальной. Доступ агента к файлам и
+командам регулируется разрешениями OpenCode.
+
+[Подробности безопасности](docs/SETUP.ru.md#безопасность).
+
+## Документация и разработка
+
+- [Полная настройка, API, troubleshooting](docs/SETUP.ru.md)
+- [Safari, GLM/Kimi, экспериментальные адаптеры и Gemini](browser/README.md)
+- [Конфиг OpenCode для проверенных подключений](examples/opencode.json)
+- [Примеры Python и HTTP](examples/README.md)
+- [Отдельный чат DeepSeek в терминале](docs/TERMINAL_CHAT.md)
+
+CI проверяет Python 3.9 и 3.12, загрузку PoW WASM, синтаксис shell/JavaScript
+и изолированные браузерные сценарии. [Запуски CI](https://github.com/Tsuev/opencode-deepseek/actions/workflows/tests.yml).
+Для локальной проверки: `python -m unittest discover -s tests -t . -v`.
+
+**MIT · неофициальный проект.** Основан на
+[Tsuev/opencode-deepseek](https://github.com/Tsuev/opencode-deepseek) и
+[sums001/Deepseek-API](https://github.com/sums001/Deepseek-API).
+Используйте свой аккаунт в рамках условий соответствующего сервиса.
+[Лицензия](LICENSE).

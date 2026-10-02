@@ -1,9 +1,9 @@
 # --- Core ---
-playwright>=1.44        # browser automation: login + PoW solving
-httpx>=0.27             # async HTTP client for chat streaming
+playwright>=1.44        # browser automation: login + session capture
+httpx>=0.27             # HTTP client for chat streaming
 fastapi>=0.111          # OpenAI-compatible server
 uvicorn[standard]>=0.30 # ASGI server
 pydantic>=2.7           # request/response models
-python-dotenv>=1.0      # load credentials from .env
+python-dotenv>=1.0      # load configuration from .env
 wasmtime>=21.0          # runs DeepSeek's PoW WASM module (deepseek/pow.py)
 openai

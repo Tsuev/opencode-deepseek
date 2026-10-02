@@ -16,17 +16,14 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
-from pathlib import Path
 
-from dotenv import load_dotenv
+from settings import ROOT, load_environment
 
-ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from deepseek import DeepSeekClient  # noqa: E402
-from deepseek.auth import LoginRequired  # noqa: E402
+from deepseek.auth import LoginRequired, write_private_json  # noqa: E402
 
 STATE_FILE = ROOT / "session" / "chat_state.json"
 
@@ -52,19 +49,12 @@ class Chat:
     # -- persistence ---------------------------------------------------------
 
     def save(self) -> None:
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(
-            json.dumps(
-                {
-                    "conversation_id": self.cid,
-                    "model": self.model,
-                    "thinking": self.thinking,
-                    "search": self.search,
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
+        write_private_json(STATE_FILE, {
+            "conversation_id": self.cid,
+            "model": self.model,
+            "thinking": self.thinking,
+            "search": self.search,
+        })
 
     def status(self) -> str:
         flags = []
@@ -96,9 +86,9 @@ class Chat:
                 sys.stdout.write(chunk)
                 sys.stdout.flush()
         finally:
-            if chunks.conversation_id:
-                self.cid = chunks.conversation_id
             print()
+        if chunks.conversation_id:
+            self.cid = chunks.conversation_id
         self.save()
 
     # -- slash commands ------------------------------------------------------
@@ -164,7 +154,7 @@ HELP = _c(BOLD, "commands") + """
 
 
 def main() -> int:
-    load_dotenv()
+    load_environment()
 
     p = argparse.ArgumentParser(
         description="Interactive DeepSeek chat in the terminal.",
@@ -185,17 +175,21 @@ def main() -> int:
     state = None
     if not args.new and STATE_FILE.exists():
         try:
-            state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            loaded = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            state = loaded if isinstance(loaded, dict) else None
         except Exception:
             state = None
 
     model = args.model or (state or {}).get("model", "default")
+    cid = (state or {}).get("conversation_id")
+    if args.model is not None and args.model != (state or {}).get("model"):
+        cid = None
     thinking = args.think if args.think is not None else (state or {}).get("thinking", False)
     search = args.search if args.search is not None else (state or {}).get("search", False)
 
     try:
         chat = Chat(model=model, thinking=thinking, search=search,
-                    conversation_id=(state or {}).get("conversation_id"))
+                    conversation_id=cid)
     except LoginRequired as e:
         print(_c(RED, str(e)))
         return 1

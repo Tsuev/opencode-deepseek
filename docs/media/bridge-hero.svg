@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="332" viewBox="0 0 1100 332" role="img">
+<title>OpenCode Web Bridge — your accounts, your workspace</title>
+<rect x="0" y="0" width="1100" height="332" rx="0" fill="#14232d" stroke="none"/>
+<text x="48" y="52" font-size="14" font-family="Arial, sans-serif" font-weight="700" fill="#8cd8bd">OPENCODE WEB BRIDGE</text>
+<text x="46" y="133" font-size="49" font-family="Arial, sans-serif" font-weight="700" fill="#f5f3ec">Your accounts.</text>
+<text x="46" y="190" font-size="49" font-family="Arial, sans-serif" font-weight="700" fill="#f5f3ec">Your coding agent.</text>
+<text x="49" y="232" font-size="19" font-family="Arial, sans-serif" font-weight="400" fill="#b9c9cf">One local API. Tools run in your workspace.</text>
+<rect x="48" y="270" width="116" height="30" rx="15" fill="#263c47" stroke="none"/>
+<text x="62" y="289" font-size="13" font-family="Arial, sans-serif" font-weight="700" fill="#dcf0e7">DeepSeek</text>
+<rect x="176" y="270" width="91" height="30" rx="15" fill="#263c47" stroke="none"/>
+<text x="190" y="289" font-size="13" font-family="Arial, sans-serif" font-weight="700" fill="#dcf0e7">Qwen</text>
+<rect x="279" y="270" width="80" height="30" rx="15" fill="#263c47" stroke="none"/>
+<text x="293" y="289" font-size="13" font-family="Arial, sans-serif" font-weight="700" fill="#dcf0e7">GLM</text>
+<rect x="371" y="270" width="82" height="30" rx="15" fill="#263c47" stroke="none"/>
+<text x="385" y="289" font-size="13" font-family="Arial, sans-serif" font-weight="700" fill="#dcf0e7">Kimi</text>
+<rect x="744" y="42" width="304" height="248" rx="20" fill="#20343f" stroke="#36535f"/>
+<text x="770" y="91" font-size="23" font-family="Menlo, monospace" font-weight="400" fill="#a5e4c9">127.0.0.1:8000</text>
+<text x="770" y="128" font-size="16" font-family="Menlo, monospace" font-weight="400" fill="#d8e2e5">/v1/chat/completions</text>
+<polyline points="770,151 1022,151" fill="none" stroke="#42606b" stroke-width="2" stroke-linejoin="round"/>
+<text x="770" y="194" font-size="19" font-family="Arial, sans-serif" font-weight="700" fill="#eff3ed">Web accounts</text>
+<text x="770" y="225" font-size="16" font-family="Menlo, monospace" font-weight="400" fill="#b9c9cf">read  ·  edit  ·  tools</text>
+<text x="770" y="260" font-size="13" font-family="Arial, sans-serif" font-weight="400" fill="#99b0bb">Account allowances apply</text>
+<polyline points="603,157 638,157 638,114 727,114" fill="none" stroke="#8cd8bd" stroke-width="2" stroke-linejoin="round"/>
+<polygon points="727,114 720,110 720,118" fill="#8cd8bd"/>
+<polyline points="727,230 682,230 682,249 602,249" fill="none" stroke="#65808f" stroke-width="2" stroke-linejoin="round"/>
+</svg>

@@ -14,8 +14,8 @@ from __future__ import annotations
 
 import threading
 import time
-from collections import defaultdict, deque
-from typing import Deque, Dict, Tuple
+from collections import OrderedDict, deque
+from typing import Deque, Tuple
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -24,10 +24,13 @@ from starlette.responses import JSONResponse
 class RateLimiter:
     """Sliding-window request counter shared across requests (thread-safe)."""
 
-    def __init__(self, limit: int, window: float = 60.0):
+    def __init__(self, limit: int, window: float = 60.0, max_keys: int = 10000):
+        if limit <= 0 or window <= 0 or max_keys <= 0:
+            raise ValueError("Rate limit, window and max_keys must be positive")
         self.limit = limit
         self.window = window
-        self._hits: Dict[str, Deque[float]] = defaultdict(deque)
+        self.max_keys = max_keys
+        self._hits: OrderedDict[str, Deque[float]] = OrderedDict()
         self._lock = threading.Lock()
 
     def hit(self, key: str, now: float) -> Tuple[bool, int, float]:
@@ -38,7 +41,20 @@ class RateLimiter:
         """
         cutoff = now - self.window
         with self._lock:
-            q = self._hits[key]
+            # Ordered by the last admitted hit: remove expired identities even
+            # if those clients never return, without scanning all active keys.
+            while self._hits:
+                oldest = next(iter(self._hits))
+                if self._hits[oldest][-1] > cutoff:
+                    break
+                self._hits.popitem(last=False)
+            q = self._hits.get(key)
+            if q is None:
+                if len(self._hits) >= self.max_keys:
+                    oldest_hits = next(iter(self._hits.values()))
+                    return False, 0, max(0.0, oldest_hits[-1] + self.window - now)
+                q = deque()
+                self._hits[key] = q
             while q and q[0] <= cutoff:
                 q.popleft()
 
@@ -47,6 +63,7 @@ class RateLimiter:
                 return False, 0, max(0.0, retry_after)
 
             q.append(now)
+            self._hits.move_to_end(key)
             return True, self.limit - len(q), 0.0
 
 
@@ -64,7 +81,7 @@ def install_rate_limit(app, limiter: RateLimiter, *, protect_prefix: str = "/v1"
             return await call_next(request)
 
         key = _client_key(request)
-        now = time.time()
+        now = time.monotonic()
         allowed, remaining, retry_after = limiter.hit(key, now)
 
         if not allowed:
@@ -87,13 +104,10 @@ def install_rate_limit(app, limiter: RateLimiter, *, protect_prefix: str = "/v1"
 
         resp.headers["X-RateLimit-Limit"] = str(limiter.limit)
         resp.headers["X-RateLimit-Remaining"] = str(remaining)
-        resp.headers["X-RateLimit-Reset"] = str(int(now + limiter.window))
+        resp.headers["X-RateLimit-Reset"] = str(int(time.time() + limiter.window))
         return resp
 
 
 def _client_key(request: Request) -> str:
-    """Best-effort client identity: first X-Forwarded-For hop, else peer IP."""
-    fwd = request.headers.get("x-forwarded-for")
-    if fwd:
-        return fwd.split(",")[0].strip()
+    """Use the ASGI peer; trusted proxy processing belongs to the ASGI server."""
     return request.client.host if request.client else "unknown"

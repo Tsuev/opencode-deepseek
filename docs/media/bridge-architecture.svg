@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="672" viewBox="0 0 1100 672" role="img">
+<title>OpenCode Web Bridge — architecture and verified provider paths</title>
+<rect x="0" y="0" width="1100" height="672" rx="0" fill="#f5f3ed" stroke="none"/>
+<text x="38" y="57" font-size="29" font-family="Arial, sans-serif" font-weight="700" fill="#182a35">A local bridge. Three connection paths.</text>
+<text x="40" y="88" font-size="16" font-family="Arial, sans-serif" font-weight="400" fill="#627782">OpenCode owns the tools; providers receive prompts and permitted tool results.</text>
+<rect x="40" y="224" width="237" height="203" rx="16" fill="#ffffff" stroke="#d3dcdb"/>
+<rect x="59" y="244" width="96" height="30" rx="15" fill="#e9eeec" stroke="none"/>
+<text x="73" y="263" font-size="13" font-family="Arial, sans-serif" font-weight="700" fill="#627782">LOCAL</text>
+<text x="61" y="319" font-size="27" font-family="Arial, sans-serif" font-weight="700" fill="#182a35">OpenCode</text>
+<text x="61" y="354" font-size="17" font-family="Arial, sans-serif" font-weight="400" fill="#627782">Agent + permissions</text>
+<text x="61" y="384" font-size="14" font-family="Menlo, monospace" font-weight="400" fill="#627782">read / edit / commands</text>
+<rect x="357" y="224" width="289" height="203" rx="16" fill="#e9efff" stroke="#bdcbee"/>
+<rect x="378" y="244" width="137" height="30" rx="15" fill="#d5dfff" stroke="none"/>
+<text x="392" y="263" font-size="13" font-family="Arial, sans-serif" font-weight="700" fill="#4169dc">LOOPBACK API</text>
+<text x="379" y="319" font-size="27" font-family="Arial, sans-serif" font-weight="700" fill="#182a35">Local bridge</text>
+<text x="379" y="354" font-size="16" font-family="Menlo, monospace" font-weight="400" fill="#4169dc">127.0.0.1:8000/v1</text>
+<text x="379" y="389" font-size="16" font-family="Arial, sans-serif" font-weight="400" fill="#627782">Queues · validation · SSE</text>
+<polyline points="277,326 345,326" fill="none" stroke="#4169dc" stroke-width="2" stroke-linejoin="round"/>
+<polygon points="345,326 338,322 338,330" fill="#4169dc"/>
+<text x="281" y="301" font-size="12" font-family="Arial, sans-serif" font-weight="400" fill="#4169dc">OpenAI</text>
+<text x="281" y="317" font-size="12" font-family="Arial, sans-serif" font-weight="400" fill="#4169dc">format</text>
+<rect x="757" y="124" width="304" height="129" rx="14" fill="#ffffff" stroke="#cfddd5"/>
+<text x="778" y="163" font-size="22" font-family="Arial, sans-serif" font-weight="700" fill="#182a35">DeepSeek / Qwen</text>
+<text x="778" y="194" font-size="15" font-family="Arial, sans-serif" font-weight="400" fill="#627782">Website HTTP + saved session</text>
+<rect x="778" y="211" width="90" height="30" rx="15" fill="#e6f3e9" stroke="none"/>
+<text x="792" y="230" font-size="13" font-family="Arial, sans-serif" font-weight="700" fill="#298261">QWEN OK</text>
+<text x="884" y="227" font-size="11" font-family="Arial, sans-serif" font-weight="400" fill="#627782">DeepSeek: user is muted</text>
+<rect x="757" y="281" width="304" height="150" rx="14" fill="#ffffff" stroke="#cfddd5"/>
+<text x="778" y="320" font-size="22" font-family="Arial, sans-serif" font-weight="700" fill="#182a35">GLM / Kimi</text>
+<text x="778" y="350" font-size="15" font-family="Arial, sans-serif" font-weight="400" fill="#627782">Signed-in Safari + Userscripts</text>
+<rect x="778" y="367" width="90" height="30" rx="15" fill="#e6f3e9" stroke="none"/>
+<text x="792" y="386" font-size="13" font-family="Arial, sans-serif" font-weight="700" fill="#298261">VERIFIED</text>
+<text x="778" y="421" font-size="11" font-family="Arial, sans-serif" font-weight="400" fill="#ab673a">Grok / Mistral: experimental on this path</text>
+<rect x="757" y="469" width="304" height="125" rx="14" fill="#eeeee9" stroke="#d6d9d0"/>
+<text x="778" y="508" font-size="22" font-family="Arial, sans-serif" font-weight="700" fill="#182a35">Gemini / Antigravity</text>
+<text x="778" y="537" font-size="15" font-family="Arial, sans-serif" font-weight="400" fill="#627782">Official CLI + eligibility check</text>
+<rect x="778" y="554" width="225" height="30" rx="15" fill="#e3e4dd" stroke="none"/>
+<text x="792" y="573" font-size="13" font-family="Arial, sans-serif" font-weight="700" fill="#627782">REGION BLOCKED IN TEST</text>
+<polyline points="646,297 698,297 698,188 745,188" fill="none" stroke="#298261" stroke-width="2" stroke-linejoin="round"/>
+<polygon points="745,188 738,184 738,192" fill="#298261"/>
+<polyline points="646,326 730,326 730,352 745,352" fill="none" stroke="#298261" stroke-width="2" stroke-linejoin="round"/>
+<polygon points="745,352 738,348 738,356" fill="#298261"/>
+<polyline points="646,358 698,358 698,530 745,530" fill="none" stroke="#a1aaa3" stroke-width="2" stroke-linejoin="round"/>
+<polygon points="745,530 738,526 738,534" fill="#a1aaa3"/>
+<rect x="40" y="491" width="606" height="104" rx="14" fill="#e8ece7" stroke="none"/>
+<text x="59" y="526" font-size="20" font-family="Arial, sans-serif" font-weight="700" fill="#182a35">Your project files</text>
+<text x="59" y="556" font-size="15" font-family="Arial, sans-serif" font-weight="400" fill="#627782">Tools execute here. Read content goes to the selected provider.</text>
+<polyline points="159,427 159,479" fill="none" stroke="#627782" stroke-width="2" stroke-linejoin="round"/>
+<text x="177" y="459" font-size="13" font-family="Arial, sans-serif" font-weight="400" fill="#627782">Tool results</text>
+<polyline points="40,623 1061,623" fill="none" stroke="#d1d8d2" stroke-width="1" stroke-linejoin="round"/>
+<text x="40" y="652" font-size="13" font-family="Arial, sans-serif" font-weight="400" fill="#627782">Text only · opt-in adapters · website account limits apply</text>
+<text x="865" y="652" font-size="13" font-family="Arial, sans-serif" font-weight="400" fill="#627782">Validation: 2026-10-02</text>
+</svg>

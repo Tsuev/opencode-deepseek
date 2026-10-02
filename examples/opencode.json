@@ -1,0 +1,101 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "local-qwen/qwen3.8-omni-flash",
+  "small_model": "local-qwen/qwen3.8-omni-flash",
+  "provider": {
+    "local-deepseek": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "DeepSeek · local bridge",
+      "options": {
+        "baseURL": "http://127.0.0.1:8000/v1",
+        "apiKey": "unused"
+      },
+      "models": {
+        "deepseek-chat": {
+          "name": "DeepSeek Chat (Instant)",
+          "tool_call": true,
+          "reasoning": false,
+          "limit": {
+            "context": 64000,
+            "output": 4096
+          }
+        },
+        "deepseek-expert": {
+          "name": "DeepSeek Expert",
+          "tool_call": true,
+          "reasoning": false,
+          "limit": {
+            "context": 64000,
+            "output": 4096
+          }
+        }
+      }
+    },
+    "local-qwen": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Qwen Chat · local bridge",
+      "options": {
+        "baseURL": "http://127.0.0.1:8000/v1",
+        "apiKey": "unused"
+      },
+      "models": {
+        "qwen3.8-omni-flash": {
+          "name": "Qwen3.8 Omni Flash",
+          "tool_call": true,
+          "reasoning": false,
+          "limit": {
+            "context": 64000,
+            "output": 4096
+          }
+        },
+        "qwen3.8-max": {
+          "name": "Qwen3.8 Max",
+          "tool_call": true,
+          "reasoning": false,
+          "limit": {
+            "context": 64000,
+            "output": 4096
+          }
+        }
+      }
+    },
+    "local-glm": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "GLM · Safari bridge",
+      "options": {
+        "baseURL": "http://127.0.0.1:8000/v1",
+        "apiKey": "unused"
+      },
+      "models": {
+        "glm-web": {
+          "name": "GLM (selected web model)",
+          "tool_call": true,
+          "reasoning": false,
+          "limit": {
+            "context": 32768,
+            "output": 4096
+          }
+        }
+      }
+    },
+    "local-kimi": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Kimi · Safari bridge",
+      "options": {
+        "baseURL": "http://127.0.0.1:8000/v1",
+        "apiKey": "unused"
+      },
+      "models": {
+        "kimi-web": {
+          "name": "Kimi (selected web model)",
+          "tool_call": true,
+          "reasoning": false,
+          "limit": {
+            "context": 32768,
+            "output": 4096
+          }
+        }
+      }
+    }
+  }
+}
