@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .env
 logs/
+.tmp/
 
 # Session artifacts — contain session tokens + cookies. NEVER commit.
 session.json
@@ -10,3 +11,4 @@ session
 *.env.*
 !.env.example
 CLAUDE.md
+

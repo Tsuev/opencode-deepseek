@@ -1,709 +1,591 @@
-# Full Free DeepSeek API → opencode (агент)
+<p align="center">
+  <img src="docs/media/bridge-hero.svg" alt="Local Account Bridge — DeepSeek Harness и OpenCode" width="100%">
+</p>
 
-Локальный **OpenAI-совместимый мост** к бесплатному веб-чату DeepSeek
-([chat.deepseek.com](https://chat.deepseek.com)), который можно подключить к
-**opencode** как обычного провайдера моделей и использовать как полноценного
-агента (чтение/правка файлов, bash, поиск по коду и т.д.) — **без API-ключа и
-оплаты**.
+<p align="center">
+  <a href="README.en.md">English</a> ·
+  <a href="#быстрый-старт">Установка</a> ·
+  <a href="#подключение-harness">Harness</a> ·
+  <a href="#подключение-opencode">OpenCode</a> ·
+  <a href="#что-работает">Провайдеры</a> ·
+  <a href="docs/HARNESS.ru.md">Справка Harness</a>
+</p>
 
-> **English version:** [README.en.md](README.en.md)
+# Ваши AI-аккаунты — в DeepSeek Harness и OpenCode
 
-> **Оригинал проекта:** <https://github.com/sums001/Deepseek-API>
-> Это неофициальный проект, не связанный с DeepSeek. Вы используете свой
-> обычный аккаунт DeepSeek и несёте ответственность за соблюдение его условий.
+Один локальный сервер соединяет **DeepSeek Harness или OpenCode** с вашими
+аккаунтами DeepSeek, Qwen, Kimi и GLM. Клиент работает с проектом и выполняет
+инструменты, мост передаёт сообщения через OpenAI-совместимый API.
+Для веб-подключений отдельный API-ключ провайдера не нужен.
 
----
+**Harness работает самостоятельно: устанавливать OpenCode для него не нужно.**
+Экспериментальные адаптеры включаются отдельно. Перед запуском прочитайте ограничения аккаунтов и настройки безопасного отказа ниже.
 
-## Содержание
+**Обновление безопасности от 12 октября 2026:** локальный `/v1` теперь требует
+токен моста. После обновления перенастройте клиент по разделу
+[Токен доступа к API](#токен-доступа-к-api). Исправления привязки аккаунта,
+защиты от повторов, shell-команд и завершения CLI проверены офлайн; это обновление
+не проверялось на живых аккаунтах в Harness, OpenCode или браузере.
 
-- [Как это работает](#как-это-работает)
-- [Требования](#требования)
-- [Единый путь развёртки (копировать целиком)](#единый-путь-развёртки-копировать-целиком)
-- [Пошагово, с пояснениями](#пошагово-с-пояснениями)
-- [Проверка работоспособности](#проверка-работоспособности)
-- [Куда слать запросы: URL и API-ключ](#куда-слать-запросы-url-и-api-ключ)
-- [Чат в терминале](#чат-в-терминале)
-- [Интеграция с opencode](#интеграция-с-opencode)
-- [Переключение моделей, DeepThink и веб-поиск](#переключение-моделей-deepthink-и-веб-поиск)
-- [Переменные окружения](#переменные-окружения)
-- [Ограничения и важные нюансы](#ограничения-и-важные-нюансы)
-- [Обслуживание и troubleshooting](#обслуживание-и-troubleshooting)
-- [Структура проекта](#структура-проекта)
-- [Безопасность](#безопасность)
-- [Лицензия](#лицензия)
+[![Проверки main](https://github.com/Tsuev/opencode-deepseek/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/Tsuev/opencode-deepseek/actions/workflows/tests.yml)
 
----
+> Это не безлимитный API. Действуют квоты аккаунта и локальные ограничения моста.
+> Автоматизация веб-чата может привести к блокировке: на нашем аккаунте DeepSeek
+> ограничения возникали повторно, точная причина не установлена. Успешный тест
+> не гарантирует доступность следующей задачи. [Защита аккаунтов](docs/ACCOUNT_SAFETY.md).
 
-## Как это работает
+## Быстрый старт
 
-```
-┌──────────────┐   OpenAI API    ┌──────────────────────┐   внутренний   ┌──────────────────┐
-│   opencode   │ ───────────────▶│  server/api.py       │ ── протокол ──▶│  chat.deepseek   │
-│ (агент/CLI)  │  localhost:8000 │  (FastAPI, /v1/...)  │  + PoW/WASM    │  .com (ваш аккаунт)│
-└──────────────┘                 └──────────────────────┘                └──────────────────┘
-                                        │
-                                        ├── deepseek/auth.py   (вход через браузер, сессия в session/)
-                                        └── deepseek/pow.py    (решение proof-of-work через wasmtime)
-```
+Понадобятся **Python 3.9+** (рекомендуется 3.12), Git, аккаунт выбранного сервиса
+и один клиент: [DeepSeek Harness](https://www.deepseek.com/en/harness/) или
+[OpenCode](https://opencode.ai/docs/). Ниже — macOS/Linux;
+[Windows и подробная настройка](docs/SETUP.ru.md).
 
-- **opencode** думает, что общается с обычным OpenAI-провайдером.
-- **Мост** транслирует запросы в веб-чат DeepSeek, решает PoW-челлендж
-  (`sha3_wasm_bg.wasm` в песочнице `wasmtime`) и отдаёт поток токенов обратно.
-- Сессия входа сохраняется в `session/` (в git не попадает) и обновляется
-  автоматически примерно раз в 5 часов.
-
----
-
-## Требования
-
-- **Python 3.9+** (рекомендуется 3.11/3.12)
-- **Node.js 18+** — нужен только для opencode (не для моста)
-- **Аккаунт DeepSeek** (бесплатный, тот же, что для chat.deepseek.com)
-- **opencode** — <https://opencode.ai>
-- ОС: Windows, macOS, Linux
-
----
-
-## Единый путь развёртки (копировать целиком)
-
-> Ниже — весь путь от нуля до работающего агента. Выполняйте блоки по порядку.
-> Замените `~/projects` на удобную вам папку.
-
-### macOS / Linux
+### 1. Установите мост
 
 ```bash
-# 0. Предпосылки: Python 3.9+, Node 18+, opencode
-python3 --version && node --version && opencode --version
-
-# 1. Клон проекта
-mkdir -p ~/projects && cd ~/projects
 git clone https://github.com/Tsuev/opencode-deepseek.git
 cd opencode-deepseek
-
-# 2. Виртуальное окружение
 python3 -m venv venv
 source venv/bin/activate
-
-# 3. Зависимости + браузер для Playwright
-pip install --upgrade pip
-pip install -r requirements.txt
-playwright install chromium
-
-# 4. Одноразовый вход в аккаунт DeepSeek (откроется окно браузера)
-python -m deepseek.auth
-
-# 5. Конфиг (значения по умолчанию подходят для локального запуска)
-cp .env.example .env
-
-# 6. Запуск сервера (оставьте терминал открытым)
-python app.py
-# -> http://127.0.0.1:8000
-```
-
-Проверка (во **втором** терминале):
-
-```bash
-curl http://127.0.0.1:8000/healthz
-curl http://127.0.0.1:8000/v1/models
-```
-
-### Windows (PowerShell)
-
-```powershell
-python --version; node --version; opencode --version
-
-mkdir $HOME\projects; cd $HOME\projects
-git clone https://github.com/Tsuev/opencode-deepseek.git
-cd opencode-deepseek
-
-python -m venv venv
-.\venv\Scripts\Activate.ps1
-
-pip install --upgrade pip
-pip install -r requirements.txt
-playwright install chromium
-
-python -m deepseek.auth
-Copy-Item .env.example .env
-python app.py
-```
-
-> Если PowerShell блокирует активацию venv:
-> `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
-> (или активируйте через `venv\Scripts\activate.bat` в `cmd.exe`).
-
-### Регистрация провайдера и агента в opencode
-
-Содержимое файлов `opencode.json` и `.opencode/agent/*.md` — в разделе
-[Интеграция с opencode](#интеграция-с-opencode). После их создания
-**перезапустите opencode**.
-
----
-
-## Пошагово, с пояснениями
-
-### 1. Клон
-
-```bash
-git clone https://github.com/Tsuev/opencode-deepseek.git
-cd opencode-deepseek
-```
-
-### 2. Виртуальное окружение
-
-Изолирует зависимости проекта от системного Python.
-
-```bash
-python3 -m venv venv
-source venv/bin/activate        # macOS/Linux
-# .\venv\Scripts\Activate.ps1   # Windows PowerShell
-```
-
-### 3. Зависимости
-
-```bash
-pip install -r requirements.txt
-playwright install chromium     # разовая установка браузера
-```
-
-`requirements.txt` тянет: `playwright` (вход + PoW), `httpx`, `fastapi`,
-`uvicorn`, `pydantic`, `python-dotenv`, `wasmtime`, `openai`.
-
-### 4. Вход в DeepSeek (один раз)
-
-```bash
-python -m deepseek.auth
-```
-
-Откроется настоящий браузер — войдите в аккаунт и пройдите капчу
-(human-check). После этого токен и cookies сохранятся в `session/` и будут
-переиспользоваться. Сессия обновляется автоматически; повторный вход нужен,
-только если она полностью истекла.
-
-### 5. Конфигурация `.env`
-
-```bash
+python -m pip install -r requirements.txt
+python -m playwright install chromium
 cp .env.example .env
 ```
 
-Для локального запуска значения по умолчанию подходят. Пароли в `.env` не
-хранятся — вход выполняется вручную в браузере.
+При обновлении существующей установки сохраняйте свой `.env` и `session/`.
+Все провайдеры в примере выключены; включайте только нужные.
 
-### 6. Запуск сервера
+### 2. Подключите аккаунт
+
+Для первого запуска ниже используется **Qwen Flash**:
+
+```bash
+python -m qwen.auth
+```
+
+Войдите сами в открытом окне, дождитесь сохранения сессии. В `.env` измените:
+
+```dotenv
+QWEN_ENABLED=1
+```
+
+Первоначальный вход требует браузера, дальнейшие запросы Qwen работают без
+вкладок. Токен короткоживущий: для продления перед новым запросом можно отдельно
+включить `QWEN_RENEW_SESSION=1`. Продление выполняется внутри durable-попытки
+этого запроса и должно вернуть тот же аккаунт. Ссылки бесед привязаны к аккаунту
+Qwen, поэтому смена токена не обрывает цели Harness. Когда истечёт cookie входа,
+снова потребуется ручной вход. [Как устроено продление](docs/HARNESS.ru.md#сессия-qwen).
+
+**Нужен DeepSeek вместо Qwen?** Выполните `python -m deepseek.auth`, войдите в
+аккаунт и задайте `DEEPSEEK_ENABLED=1`. В команде установки Harness ниже замените
+`qwen3.8-omni-flash` на `deepseek-chat` или `deepseek-expert`. Автоматического
+продления DeepSeek нет; сохранённая сессия используется независимо от возраста.
+При отказе токена (`40002`/`40003`) запросы останавливаются без повторов; нужен ручной вход. Новый захват `python -m deepseek.auth` сохраняет историю Harness только для того же подтверждённого аккаунта; другой аккаунт отклоняется (осознанная замена — `--replace-account`), а для неподтверждённой прежней сессии нужен `--same-account`. Не продолжайте запросы при предупреждении об ограничении аккаунта.
+
+Для Kimi используйте [отдельную настройку HTTP-сессии](docs/KIMI.md),
+для GLM — [подключение вкладки Safari](browser/README.md#safari).
+
+### 3. Запустите сервер
 
 ```bash
 python app.py
-# -> DeepSeek OpenAI-compatible API on http://127.0.0.1:8000
 ```
 
-Альтернатива через uvicorn с другим адресом:
+Оставьте этот терминал открытым. Один процесс обслуживает все включённые
+подключения; второй экземпляр не нужен. В другом терминале:
 
 ```bash
-HOST=0.0.0.0 PORT=8080 python app.py
-# или
-uvicorn server.api:app --host 0.0.0.0 --port 8080
-```
-
-### 7. Автозапуск при входе в систему (macOS, опционально)
-
-Чтобы сервер поднимался сам и перезапускался при падении, заведите LaunchAgent
-`~/Library/LaunchAgents/com.deepseek.api.plist`:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key><string>com.deepseek.api</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/Users/ВЫ/root/other/Deepseek-API/venv/bin/python</string>
-        <string>app.py</string>
-    </array>
-    <key>WorkingDirectory</key><string>/Users/ВЫ/root/other/Deepseek-API</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>HOST</key><string>127.0.0.1</string>
-        <key>PORT</key><string>8000</string>
-    </dict>
-    <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><true/>
-    <key>StandardOutPath</key><string>/Users/ВЫ/root/other/Deepseek-API/logs/server.log</string>
-    <key>StandardErrorPath</key><string>/Users/ВЫ/root/other/Deepseek-API/logs/server.err</string>
-</dict>
-</plist>
-```
-
-```bash
-mkdir -p logs
-launchctl load  ~/Library/LaunchAgents/com.deepseek.api.plist   # включить
-launchctl kickstart -k "gui/$(id -u)/com.deepseek.api"          # перезапуск после правок кода
-launchctl unload ~/Library/LaunchAgents/com.deepseek.api.plist  # выключить
-```
-
-> Важно: при `reload=False` (как в `app.py`) изменения кода подхватываются
-> только после перезапуска — используйте `kickstart -k`. Логи смотрите в
-> `logs/server.log` и `logs/server.err`.
-
----
-
-## Проверка работоспособности
-
-```bash
-# 1) Живость
 curl http://127.0.0.1:8000/healthz
-# {"status":"ok"}
-
-# 2) Список моделей
-curl http://127.0.0.1:8000/v1/models
-
-# 3) Простой чат
-curl http://127.0.0.1:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"Привет!"}]}'
+curl -H "Authorization: Bearer $(cat "$(python -m server.api_auth path)")" http://127.0.0.1:8000/v1/models
 ```
 
-Python SDK:
+Эти проверки локальные и не отправляют запросы моделям. Каждый запрос к `/v1`
+требует токен API моста (см. [Токен доступа к API](#токен-доступа-к-api)). В каталоге должна
+появиться выбранная модель. Затем подключите **свой клиент** ниже.
 
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
-r = client.chat.completions.create(
-    model="deepseek-chat",
-    messages=[{"role": "user", "content": "Hello!"}],
-)
-print(r.choices[0].message.content)
-```
+## Токен доступа к API
 
-Готовые примеры: [examples/](examples/) (`01_*` — напрямую из Python, `04_*`–`06_*` — через сервер).
+API `/v1` управляет вашими аккаунтами провайдеров, поэтому требует
+`Authorization: Bearer <токен>` и локальный `Host`. Сервер при первом
+обращении создаёт приватный файл `session/api-token` (`0600`);
+`python -m server.api_auth path` печатает путь к нему, но не сам токен. Запросы
+без токена, со страниц браузера (cross-site или DNS rebinding) и на чужой Host
+отклоняются до обращения к провайдеру и к rate-limit.
 
----
+Миграция с бесключевого API:
 
-## Куда слать запросы: URL и API-ключ
+1. Обновите мост и перезапустите его.
+2. Harness: повторите `python -m integrations.harness --install <профиль> ...` с
+   прежними параметрами. Заголовок `Bearer unused` заменится токеном в
+   приватном файле профиля. Перезапустите Harness.
+3. OpenCode: укажите `"apiKey": "{file:/абсолютный/путь/session/api-token}"` для
+   каждого локального провайдера ([пример](examples/opencode.json)). Прочие
+   клиенты OpenAI SDK передают токен как `api_key`.
+4. Только на время миграции `API_AUTH=legacy-loopback` пропускает запросы без
+   токена от loopback-клиента с loopback Host и без заголовков браузера. Уберите
+   настройку, когда клиенты начнут передавать токен.
 
-Базовый адрес — `http://localhost:8000/v1` (или `http://127.0.0.1:8000/v1`).
-Порт меняется переменной `PORT` в `.env` / launchd.
+`HOST` вне loopback отклоняется без `API_ALLOW_PUBLIC_BIND=1` (только в режиме
+токена). Тогда также перечислите обслуживаемые имена в `API_ALLOWED_HOSTS` и
+закройте порт межсетевым экраном. Эта проверка адреса есть только в `python app.py`:
+прямой запуск `uvicorn server.api:app --host …` её обходит, хотя Host и токен
+(кроме переходного `legacy-loopback`) по-прежнему проверяются для каждого `/v1`.
 
-| Метод | URL | Назначение |
-| --- | --- | --- |
-| `POST` | `http://localhost:8000/v1/chat/completions` | Чат; стриминг через `"stream": true` |
-| `GET` | `http://localhost:8000/v1/models` | Список моделей (`deepseek-chat`, `deepseek-expert`) |
-| `GET` | `http://localhost:8000/healthz` | Проверка живости (без рейт-лимита) |
+## Подключение Harness
 
-**API-ключ:** любой. Мост **не проверяет** `Authorization` и не читает его
-(`server/api.py` не смотрит заголовок), поэтому в SDK, где ключ обязателен
-синтаксически, пишут заглушку — исторически `api_key="unused"`. В чистом HTTP
-через `curl` заголовок `Authorization` вообще не нужен.
-
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
-```
+1. Установите и один раз откройте [официальный Harness](https://www.deepseek.com/en/harness/).
+   При начальной настройке можно выбрать **Add API Key → Set up later**.
+2. В другом терминале перейдите в каталог моста, активируйте `source venv/bin/activate`
+   и выполните при работающем сервере:
 
 ```bash
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"Hi"}]}'
+python -m integrations.harness --install desktop --without-browser --default-model qwen3.8-omni-flash
+python -m integrations.harness_shell_safety --profile desktop
 ```
 
-Нестандартные поля (вне схемы OpenAI) передаются через `extra_body`:
-`thinking` (DeepThink), `search` (веб-поиск), `conversation_id` (продолжить
-диалог; при resume модель игнорируется). Лимит — `RATE_LIMIT_PER_MINUTE`
-(по умолчанию 30/мин на IP), `/healthz` не считается.
+3. В Harness выберите **папку проекта**, создайте **новую сессию** и в меню моделей
+   выберите группу **Local account bridge** → нужную модель. Если группа ещё не
+   появилась, перезапустите Harness. Старые сессии могут сохранять прежнюю модель.
+4. Начните с небольшой задачи, например: «Прочитай README проекта и кратко
+   объясни его назначение». Следите за вызовами инструментов и итоговым ответом.
 
----
+Установщик читает локальный каталог, сохраняет резервную копию профиля и
+обновляет `~/.dsh/profiles/desktop/cordis.patch.yml`. Он отключает автоматические
+повторы и генерацию заголовков моделью. Аккаунтам ничего не отправляет.
 
-## Чат в терминале
-
-`chat.py` — интерактивный REPL, который ходит в chat.deepseek.com напрямую
-через `DeepSeekClient`. Сервер (`app.py`) для этого не нужен.
-
-```bash
-./ds                      # продолжить последний диалог
-./ds --new                # начать новый диалог
-./ds --model expert       # Expert — сильнее и медленнее, чем Instant
-./ds --think --search     # DeepThink-размышление + веб-поиск
-./ds --no-think           # выключить DeepThink для этого запуска
-```
-
-Внутри чата:
-
-| Команда | Что делает |
+| Что подключаете | Как настроить Harness |
 | --- | --- |
-| `/new` | новый диалог (история на сайте сохраняется) |
-| `/model default` \| `/model expert` | сменить модель (модель фиксируется при создании треда, поэтому смена открывает новый диалог) |
-| `/think` | переключить DeepThink |
-| `/search` | переключить веб-поиск |
-| `/status` | текущая модель и переключатели |
-| `/exit` | выйти (работает и Ctrl-D) |
+| DeepSeek, Qwen, прямой HTTP Kimi | Команда выше с `--without-browser` и доступным `--default-model` |
+| GLM или `kimi-web` через вкладку | Настройте вкладку, повторите команду **без** `--without-browser`; выберите `glm-web` или `kimi-web` |
+| Web UI / CLI | Для уже созданного профиля замените `--install desktop` на `--install web` / `--install headless` |
+| Добавили или отключили провайдера | Перезапустите мост и повторите установку каталога с нужными флагами |
 
-Ответ печатается по мере генерации. Строка, заканчивающаяся на `\`, продолжается
-на следующей. Текущий диалог и настройки сохраняются в `session/chat_state.json`,
-так что следующий запуск `./ds` его продолжит.
+`--without-browser` отбирает подходящие адаптеры; он не отменяет первоначальный
+вход и не превращает GLM в HTTP-подключение. Каталог не подтверждает доступность
+аккаунта. [Полная инструкция Harness](docs/HARNESS.ru.md).
 
-Запуск из любой директории — поставьте shim один раз:
+### Счётчики и сброс в Harness
 
-```bash
-mkdir -p ~/bin && ln -sf "$(pwd)/bin/ds-chat" ~/bin/ds-chat
-# убедитесь, что ~/bin в PATH
-```
+После [установки плагина локальных лимитов](docs/HARNESS.ru.md#счётчики-и-ручной-сброс)
+доступны команды, которые выполняются **без обращения к модели**:
 
-Вариант `Command+L` прямо в терминале Kaku — в
-**[docs/TERMINAL_CHAT.md](docs/TERMINAL_CHAT.md)**.
-
-Демонстрация `Command+L` в Kaku (25 секунд):
-
-[![Command+L в Kaku — чат DeepSeek](docs/media/kaku-ai.png)](docs/media/kaku-ai.mp4)
-
-Видео: [`docs/media/kaku-ai.mp4`](docs/media/kaku-ai.mp4) — H.264/AAC,
-1276×992, 1.4 МБ. Превью: `docs/media/kaku-ai.png` (нажмите на картинку, чтобы
-открыть видео).
-
----
-
-## Интеграция с opencode
-
-opencode подключается к мосту как к **OpenAI-совместимому провайдеру**.
-
-### 1. Провайдер в `opencode.json`
-
-Создайте `opencode.json` в корне вашего рабочего проекта (или в
-`~/.config/opencode/opencode.json` для глобальной настройки):
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "local-deepseek": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "DeepSeek (local bridge)",
-      "options": {
-        "baseURL": "http://127.0.0.1:8000/v1",
-        "apiKey": "unused"
-      },
-      "models": {
-        "deepseek-chat": {
-          "name": "DeepSeek Chat (Instant)",
-          "tool_call": true,
-          "reasoning": false,
-          "limit": { "context": 64000, "output": 8192 }
-        },
-        "deepseek-expert": {
-          "name": "DeepSeek Expert",
-          "tool_call": true,
-          "reasoning": false,
-          "limit": { "context": 64000, "output": 8192 }
-        }
-      }
-    }
-  }
-}
-```
-
-- `npm: "@ai-sdk/openai-compatible"` — универсальный OpenAI-совместимый драйвер.
-- `apiKey` обязателен для SDK, но мост его игнорирует.
-- `model` в opencode указывается как `local-deepseek/deepseek-chat` или
-  `local-deepseek/deepseek-expert`.
-- `limit.context` — приблизительный; уменьшите, если получаете ошибки о
-  переполнении контекста.
-
-### 2. (Опционально) Сделать DeepSeek моделью по умолчанию
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "model": "local-deepseek/deepseek-chat",
-  "small_model": "local-deepseek/deepseek-chat",
-  "provider": { "local-deepseek": { "npm": "@ai-sdk/openai-compatible", "name": "DeepSeek (local bridge)", "options": { "baseURL": "http://127.0.0.1:8000/v1", "apiKey": "unused" }, "models": { "deepseek-chat": { "name": "DeepSeek Chat (Instant)", "tool_call": true }, "deepseek-expert": { "name": "DeepSeek Expert", "tool_call": true } } } }
-}
-```
-
-> `small_model` используется для служебных задач (генерация заголовков и т.п.).
-
-### 3. Агент
-
-Файл `.opencode/agent/deepseek.md` в корне рабочего проекта:
-
-```markdown
----
-description: Инженерный агент на DeepSeek через локальный мост
-mode: primary
-model: local-deepseek/deepseek-expert
-temperature: 0.3
-permission:
-  edit: allow
-  webfetch: allow
-  bash:
-    "git *": allow
-    "*": ask
----
-
-Ты — аккуратный инженерный агент. Сначала изучаешь код, затем предлагаешь
-минимальные точечные правки. Не добавляешь комментарии без просьбы. После
-изменений запускаешь линтер и тесты проекта, если они есть.
-```
-
-- `mode: primary` — агент доступен как основной (переключается в TUI/через
-  `default_agent`). Для вспомогательного агента используйте `mode: subagent`.
-- Тело файла — это системный промпт агента.
-
-Чтобы назначить его агентом по умолчанию, добавьте в `opencode.json`:
-
-```json
-{ "default_agent": "deepseek" }
-```
-
-### 4. Перезапуск
-
-opencode читает конфиг один раз при старте. **Полностью закройте и заново
-запустите opencode** после создания/правки `opencode.json` и файлов агентов.
-
-Проверка: в opencode откройте выбор модели — должны появиться
-`DeepSeek Chat (Instant)` и `DeepSeek Expert` под провайдером
-`DeepSeek (local bridge)`.
-
-### 5. Почему модель не вносит правки (эмуляция tool calling)
-
-У веб-чата DeepSeek **нет канала function calling**, поэтому мост эмулирует его
-текстом: подмешивает в промпт инструкцию «ответь ровно одним блоком
-```` ```tool_calls ```` JSON» и затем парсит ответ обратно
-([server/openai_format.py](server/openai_format.py)). Если модель пишет прозу
-вместо вызова, opencode просто печатает текст и **ничего не выполняет**.
-
-Что сделано для надёжности:
-
-- парсер принимает фенсы, JSON внутри прозы, а также нативный XML/DSML DeepSeek
-  (`<tool_call>`, `function<|tool_sep|>name`);
-- инструкция усилена (запрет прозы + пример + напоминание в конце);
-- плагин дисциплины добавляет позднюю системную инструкцию.
-
-Диагностика: запустите сервер с `DEBUG_TOOLCALLS=1` — при нераспознанном вызове
-в лог (`logs/server.log` или stdout) попадёт сырой ответ модели.
-
-```bash
-DEBUG_TOOLCALLS=1 python app.py
-```
-
-Проверить мост напрямую (без opencode):
-
-```bash
-curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" -d '{
-  "model": "deepseek-chat",
-  "messages": [{"role":"user","content":"Create a file /tmp/x.txt with hello"}],
-  "tools": [{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"filePath":{"type":"string"},"content":{"type":"string"}}}}}]
-}'
-```
-
-Успех — `"finish_reason": "tool_calls"` и заполненный `message.tool_calls`.
-
----
-
-## Переключение моделей, DeepThink и веб-поиск
-
-| Что | Значение в opencode | Примечание |
-| --- | --- | --- |
-| Быстрая модель | `local-deepseek/deepseek-chat` | По умолчанию |
-| Экспертная модель | `local-deepseek/deepseek-expert` | Сильнее, медленнее |
-| DeepThink (reasoning) | — | Через `extra_body`, см. ниже |
-| Веб-поиск | — | Через `extra_body`, см. ниже |
-
-Модель задаётся в opencode штатно (выбор модели или поле `model` в агенте).
-`thinking` (DeepThink) и `search` (веб-поиск) — это **не** модели, а
-дополнительные флаги тела запроса, которые opencode напрямую не передаёт.
-Их можно включить плагином (см. ниже) либо запросами через `curl`/SDK:
-
-```python
-resp = client.chat.completions.create(
-    model="deepseek-expert",
-    messages=[{"role": "user", "content": "Что нового в мире?"}],
-    extra_body={"thinking": True, "search": True},
-)
-```
-
-### Плагин дисциплины инструментов (важно для агента)
-
-Из-за эмуляции tool calling (см. выше) модель склонна «описывать» действие
-вместо вызова. Плагин добавляет позднюю системную инструкцию, требующую реальных
-tool calls. Файл авто-подхватывается opencode без правки конфига:
-
-- глобально: `~/.config/opencode/plugin/deepseek-tool-discipline.js`
-- в проекте: `.opencode/plugin/deepseek-tool-discipline.js` (лежит в репозитории)
-
-```js
-export const DeepSeekToolDiscipline = async () => ({
-  "experimental.chat.system.transform": async (input, output) => {
-    if (input?.model?.providerID !== "local-deepseek") return;
-    output.system.push(
-      "CRITICAL: to act you MUST emit real tool calls; never describe the " +
-      "action, never print JSON/XML or a tool_calls block as visible text."
-    );
-  },
-});
-```
-
-> Хуки `experimental.*` помечены экспериментальными (проверено на opencode
-> 1.18.x). Если их переименуют, плагин просто перестанет срабатывать и не
-> сломает запуск.
-
-### DeepThink и веб-поиск (опционально)
-
-`thinking`/`search` — нестандартные поля тела запроса; opencode их напрямую не
-передаёт. Их можно добавить хуком `chat.params` (`output.options.thinking =
-true`), но **не включайте reasoning по умолчанию** — он ухудшает соблюдение
-формата tool calls. Через `curl`/SDK они работают сразу:
-
-```python
-resp = client.chat.completions.create(
-    model="deepseek-expert",
-    messages=[{"role": "user", "content": "Что нового в мире?"}],
-    extra_body={"thinking": True, "search": True},
-)
-```
-
----
-
-## Переменные окружения
-
-Файл `.env` (копия `.env.example`):
-
-| Переменная | По умолчанию | Назначение |
-| --- | --- | --- |
-| `HOST` | `127.0.0.1` | Адрес прослушивания |
-| `PORT` | `8000` | Порт |
-| `RATE_LIMIT_PER_MINUTE` | `30` | Лимит запросов/мин на IP клиента (`/healthz` не считается) |
-| `DEEPSEEK_PROFILE_DIR` | — | Переиспользовать существующий профиль Chrome с активной сессией |
-| `SERVER_INTERACTIVE_LOGIN` | `1` | Открывать окно браузера при отсутствии сессии; `0` — отдавать `503` (для headless) |
-| `SESSION_REFRESH_ENABLED` | `1` | Фоновое обновление сессии |
-| `SESSION_REFRESH_INTERVAL` | `18000` (5 ч) | Интервал обновления, сек (меньше `SESSION_MAX_AGE` = 6 ч) |
-| `REFRESH_BROWSER_CHANNEL` | `chromium-headless-shell` | Канал Playwright для headless-обновления (меньше RAM) |
-| `REFRESH_BROWSER_CHANNEL_FALLBACK` | `chrome` | Запасной канал, если headless не читает cookies; пусто — отключить |
-| `TOOLCALL_MAX_CONTINUATIONS` | `3` | Сколько раз допрашивать модель «продолжи», если tool call обрезан лимитом вывода |
-| `DEBUG_TOOLCALLS` | — | `1` — писать в лог сырой ответ модели, если вызов не распознан |
-
-Пример:
-
-```bash
-HOST=0.0.0.0 PORT=8080 RATE_LIMIT_PER_MINUTE=60 python app.py
-```
-
----
-
-## Ограничения и важные нюансы
-
-- **Сериализация запросов.** Один общий аккаунт, PoW-хранилище `wasmtime`
-  не реентерабельно, поэтому апстрим-вызовы выполняются **по одному**
-  (см. `server/api.py`). Параллельные запросы встают в очередь — не стоит
-  запускать несколько агентов/сессий одновременно.
-- **Tool calling эмулируется.** Мост буферизует ответ и парсит его в tool
-  calls (`server/openai_format.py`, `parse_tool_calls`). Парсер терпим к прозе,
-  фенсам и XML/DSML DeepSeek, но это всё равно менее надёжно, чем нативный API:
-  возможны сбои на длинных многошаговых цепочках. Помогает плагин дисциплины и
-  `DEBUG_TOOLCALLS=1` для диагностики.
-- **Нет реального подсчёта токенов.** `usage` — грубая оценка ~4 символа/токен.
-- **Большинство OpenAI-параметров игнорируется** (`temperature`, `top_p`,
-  `max_tokens` и т.д.). Действуют только `model`, `messages`, `stream`,
-  `conversation_id`, `thinking`, `search`.
-- **Vision не поддерживается** (нет загрузки изображений).
-- **Идентификатор диалога.** `conversation_id` фиксирует модель при создании
-  потока; при продолжении `model` игнорируется.
-- **Лимит рейта.** При `429` используйте экспоненциальную задержку —
-  официальный `openai` SDK делает это автоматически.
-- **Не хаммерьте аккаунт.** Это ваш обычный аккаунт DeepSeek; массовые
-  автоматические запросы могут привести к блокировке.
-
----
-
-## Обслуживание и troubleshooting
-
-**Сессия истекла / `503 login_required`**
-
-```bash
-python -m deepseek.auth   # войдите заново
-```
-
-Убедитесь, что `SERVER_INTERACTIVE_LOGIN=0` на headless-деплое, а окно входа
-выполнено заранее.
-
-**`Playwright Sync API inside the asyncio loop`**
-
-Не вызывайте синхронный Playwright из event loop — мост уже оборачивает вызовы
-в `run_in_threadpool`. Такое сообщение обычно означает нестандартную
-модификацию кода.
-
-**Ошибки PoW / wasmtime**
-
-```bash
-pip install --upgrade wasmtime
-```
-
-**Пустая headless-сессия (macOS, Chrome-профиль)**
-
-По умолчанию фолбэк на `chrome`. Оставьте `REFRESH_BROWSER_CHANNEL_FALLBACK=chrome`
-или задайте `DEEPSEEK_PROFILE_DIR`.
-
-**`429 Too Many Requests`**
-
-Поднимите `RATE_LIMIT_PER_MINUTE` и/или добавьте ретраи с backoff.
-
-**Порт занят**
-
-```bash
-PORT=8080 python app.py
-```
-
-и укажите `http://127.0.0.1:8080/v1` в `baseURL` провайдера opencode.
-
-**Агент отвечает текстом, но файлы не меняет (нет tool calls)**
-
-1. В `opencode.json` у моделей должно быть `"tool_call": true`.
-2. Проверьте мост напрямую `curl`-запросом с `tools` (см.
-   [Интеграция с opencode](#интеграция-с-opencode)): должен вернуться
-   `"finish_reason": "tool_calls"` и непустой `message.tool_calls`.
-3. Поставьте плагин `deepseek-tool-discipline.js` (глобально или в проект).
-4. Запустите сервер с `DEBUG_TOOLCALLS=1` и изучите сырой ответ модели в логе.
-5. Увеличьте `steps` у агента и используйте `deepseek-expert`.
-
-**Правки кода не применились после редактирования (launchd)**
-
-Сервер под launchd с `reload=False` — перезапустите его:
-`launchctl kickstart -k "gui/$(id -u)/com.deepseek.api"`.
-
-**Изменения в `opencode.json`/агентах не применились**
-
-Перезапустите opencode — конфиг не перезагружается на лету.
-
----
-
-## Структура проекта
-
-| Путь | Назначение |
+| Команда | Результат |
 | --- | --- |
-| `app.py` | Точка входа — запускает сервер |
-| `deepseek/` | Ядро: `DeepSeekClient`, вход (`auth.py`), HTTP-драйвер (`client.py`), PoW (`pow.py`) |
-| `server/` | FastAPI OpenAI-совместимый сервер (`api.py`, `config.py`, `openai_format.py` — парсер tool calls, `ratelimit.py`, `schemas.py`) |
-| `.opencode/plugin/` | Плагин дисциплины инструментов для opencode |
-| `examples/` | Запускаемые примеры (прямой Python и через сервер) |
-| `session/` | Сохранённая сессия (cookies + токен), **git-ignored** |
-| `logs/` | Логи launchd-сервиса, **git-ignored** |
-| `.env.example` | Шаблон конфигурации |
-| `requirements.txt` | Python-зависимости |
+| `/bridge-budget` | Расход и остаток шести скользящих бюджетов DeepSeek: генерации, новые чаты и HTTP за час/сутки |
+| `/bridge-budget-reset` | Предпросмотр сброса, без изменения счётчиков |
+| `/bridge-budget-reset CONFIRM` | Подтверждение в той же сессии в течение 60 секунд |
 
----
+Сброс затрагивает только локальный расход. Он не снимает паузу провайдера,
+не меняет квоты сайта, интервалы запросов или историю диалога. При активном
+или неразрешённом запросе, а также изменении расхода после предпросмотра сброс
+отклоняется. Плагин требует отдельный приватный токен; одного подключения моделей
+недостаточно.
 
-## Безопасность
+### Обновление DeepSeek через Safari
 
-- Всё в `session/` (cookies + bearer-токен) остаётся **на вашей машине** и
-  исключено из git (`.gitignore`). Никогда не коммитьте `session/`.
-- Пароли/секреты в `.env` не хранятся — вход выполняется вручную в браузере.
-- При `HOST=0.0.0.0` мост доступен в сети без аутентификации. Биндитесь только
-  на `127.0.0.1` или закрывайте firewall'ом/прокси.
-- Не публикуйте `session/` и `.env` в публичных репозиториях.
+На macOS выберите **deepseek-login** в меню команд Harness или введите
+`/deepseek-login`. Откроется Safari; при необходимости войдите в тот же аккаунт.
+Сессия перенесётся локально, без инспектора и копирования токена. Результат —
+`/deepseek-login-status`; продолжение цели запускаете сами.
 
----
+Один раз обновите плагин локального бюджета, установите
+[DeepSeek session transfer](browser/deepseek-session-transfer.user.js) в папку
+Save Location приложения Userscripts и разрешите доступ к `chat.deepseek.com`
+и `127.0.0.1`. После завершения активной работы перезапустите обновлённый мост
+и Harness. Поддерживается macOS и мост на `127.0.0.1`. При `PORT`, отличном от
+8000, выполните `python -m providers.tab_bridge` и установите экспортированную
+копию из `session/browser-bridge/userscripts`, а плагин бюджета переустановите с
+`python -m integrations.harness_budget --base-url http://127.0.0.1:<PORT> ...`
+(без явного адреса берётся `PORT` из окружения или `.env`, иначе 8000).
+Явный `--base-url` имеет приоритет даже при ошибочном `PORT`; разрешён только
+HTTP-адрес loopback без учётных данных, пути, query или fragment.
+[Настройка и правила восстановления](docs/HARNESS.ru.md#обновление-сессии-через-safari).
 
-## Лицензия
+История, счётчики и интервалы сохраняются; цель автоматически не возобновляется.
+При первом переносе нужно подтвердить тот же аккаунт, далее сверяется сохранённый
+идентификатор. Это ручное восстановление сессии, а не фоновое автопродление.
+Офлайн-проверки пройдены; сквозная проверка нового сценария на живом аккаунте
+пока не выполнена.
 
-[MIT License](LICENSE). Проект неофициальный; вы отвечаете за соблюдение
-условий использования DeepSeek.
+### Диагностика оборванного ответа DeepSeek
 
-**Оригинал:** <https://github.com/sums001/Deepseek-API>
+`DEEPSEEK_STREAM_DIAGNOSTICS=1` включает приватное сохранение сбойного SSE-потока
+после перезапуска моста. Файлы лежат в `session/failed-streams/` с правами `0600`:
+до четырёх записей, до 8 МиБ принятых байтов на каждую. Ответ может содержать
+приватный код — не публикуйте эти файлы. Успешные ответы не сохраняются.
+
+Офлайн-разбор: `python -m deepseek.stream_diagnostics session/failed-streams/<id>.json`.
+Только полный поток с распознанным завершением и корректным ID ответа может дать
+приватный файл `.review.json`. Это **кандидат для проверки**, не разрешение на
+выполнение инструментов: команда не меняет историю, счётчики или паузу и не
+возобновляет цель. Без маркера окончания или при обрыве восстановление отклоняется.
+Старый сбой без сохранённых байтов восстановить таким способом нельзя.
+[Подробности](docs/HARNESS.ru.md#приватная-диагностика-потока).
+
+Если DeepSeek возвращает `context_length_exceeded`, исчерпан контекст самого
+диалога. Это не локальный бюджет и не истёкшая сессия: сброс счётчиков и перевход
+не помогут. Мост сохраняет историю и останавливается; новый чат автоматически
+не создаётся. Перенос цели в новый диалог требует отдельного ручного решения.
+
+Отключение `TOOLCALL_FORMAT_REPAIR` запрещает дополнительную генерацию для
+исправления формата, но не отключает проверку разметки инструментов. Некорректный
+блок вызовов останавливает шаг; он не выдаётся за обычный успешный текст.
+После нормального завершения ответа DeepSeek допускается пояснение перед одним
+явным завершающим блоком `tool_calls`. Мост локально нормализует плоские аргументы
+по объявленной схеме и известные закрывающие DSML-маркеры; значения не переписывает.
+Пустой объект аргументов допустим только если схема его принимает. Каждый вызов
+проходит JSON Schema (типы, обязательные поля, вложенные структуры и ограничения);
+ошибка в одном вызове отклоняет весь пакет. Дубли ключей, неизвестные инструменты,
+неоднозначные оболочки, лишний текст после блока и незавершённые данные отклоняются.
+Обычные цитаты в пояснении допускаются перед отдельным блоком `tool_calls`, если
+перед его строкой открытия есть пустая строка. Цитируемые, вложенные и неоднозначные
+блоки кода не выполняются; маркеры `>` никогда не удаляются из кода.
+Обычные блоки `json` и цитаты не становятся вызовами. Явный `tool_calls` — протокол
+действия, поэтому не используйте его для примеров в пояснении. Удалённые схемы не
+загружаются; локальные `$ref` поддерживаются. При обновлении установите зависимости
+из `requirements.txt` (добавлен `jsonschema`) и перезапустите мост.
+
+Также при нормальном завершении и закрытом блоке допускается перестановка двух
+последних скобок `]}` → `}]`, если строковый анализ подтверждает: аргументы уже
+полностью закрыты, открыты только объект вызова и внешний массив. Никакие значения
+или скобки не добавляются. Исправленный пакет заново проходит JSON Schema;
+повреждённые строки, вложенные аргументы и неоднозначные окончания отклоняются.
+
+Для завершённого ответа DeepSeek с закрытым блоком также допустимо восстановить
+пропущенные `}` оболочек между вызовами и перед концом массива (не более 32):
+только если каждый `arguments` уже полностью закрыт,
+объект вызова содержит ровно `name` и `arguments`, а префикс и весь пакет строго
+разбираются после вставки. Аргументы не дополняются и не угадываются. Весь пакет
+заново проверяется по схемам; прочие повреждения и ошибки внутри аргументов
+отклоняются без частичного выполнения.
+
+Весь ответ проходит единый офлайн-контракт `server/tool_protocol.py`: разбор
+оболочки → проверка каждого вызова по схеме → политика `tool_choice` и завершения →
+выдача целого пакета. Транспорт и приватный регрессионный прогон используют одну
+проверку. Неполные аргументы и выдуманные результаты инструментов остаются ошибками.
+Это эмуляция вызовов через текст веб-чата, а не нативный tool API; офлайн-тесты
+не гарантируют, что модель всегда выдаст корректный следующий ответ.
+
+При включённой приватной диагностике сохраняются до 32 уникальных сбоев в
+`session/toolcall-failures/` (до 4 МиБ каждый), без автоматического удаления старых;
+`last-toolcall-error.json` продолжает обновляться. Ответы могут содержать исходный
+код: каталог приватный и исключён из Git. Обезличенные общие проверки:
+`python -m unittest tests.test_tool_protocol tests.test_api tests.test_diagnostics`.
+Для локального набора с проверенными ожиданиями и SHA-256:
+`python -m server.offline_corpus session/protocol-corpus.json`.
+Этот манифест приватный, создаётся при разборе диагностик и не входит в репозиторий;
+ожидания нельзя автоматически принимать за правильные по результату парсера.
+
+Намеренная остановка после передачи восстановленного ответа возвращает обычное
+сообщение с `finish_reason=stop`, без ошибки и без нового вызова провайдера.
+Она завершает ход восстановления, а не пользовательскую цель. Старые записи
+`Failed` в истории не переписываются. Проверено офлайн для JSON и SSE;
+поведение автоматического продолжения целей в живом Harness этим не проверялось.
+При следующем явном продолжении локальное уведомление не подменяет ID ответа:
+мост проверяет исходную привязку и все результаты инструментов, сохраняя одноразовое
+потребление ответа. Дополнительная привязка, позволяющая повторить действия, не создаётся.
+
+Офлайн-аудит также исправил создание сессий Qwen при входе и продлении:
+`expires_at` передаётся по имени и больше не попадает в поле привязки диалога.
+Существующие файлы сессий автоматически не изменяются; реальный вход для этой
+проверки не выполнялся.
+
+Перед ответом модель получает краткий список обязательных полей из схем и указание
+на обязательный успешный `read` того же `file_path` перед `edit` в Harness.
+Просмотр через `bash` (`cat`, `grep`, `git diff` и т. п.) не засчитывается.
+Зависимый `edit` отправляется только после результата `read`, отдельным ответом;
+уже выполненное подходящее чтение без необходимости не повторяется. Проверка
+самого Harness остаётся включённой; обход через другую команду записи запрещён.
+При установленном требовании остановки на ошибке автоматический повтор не разрешается.
+Контракт проверен офлайн и одним реальным продолжением Harness: `read` README →
+успешный результат → отдельный `edit` → штатный `Completed`, без ошибок инструментов.
+Это не гарантия полного соблюдения плана: в том же ходе модель лишний раз повторила
+уже пройденный тестовый прогон вопреки указанию не повторять неизменённые проверки.
+Для этого случая добавлен контракт повторного использования проверок: успешный
+результат сохраняет силу, пока не изменились проверяемый код, тесты, зависимости,
+конфигурация или окружение и не появился конкретный новый вопрос либо явный запрос
+на свежий прогон. Правка только текста README, новый ход или «финальная проверка»
+сами по себе не разрешают повтор. Повтор нельзя прятать в команде с `git diff`
+или `git status`; при обоснованном повторе причина указывается в описании команды.
+Старые результаты явно обозначаются как прежние; пропуски не считаются прохождением.
+Контракт проверен офлайн и в одном реальном ходе: модель использовала прежние
+результаты, не запускала тесты и перешла к чтению существующих CI-результатов.
+Это инструкция модели, не семантическая блокировка повторных тестов.
+Для остановки на ошибках shell установите локальный плагин Harness:
+
+```bash
+python -m integrations.harness_shell_safety --profile desktop
+```
+
+Перезапустите Harness после установки. Команда `/bridge-shell-status` проверяет активный исполнитель локально, без генерации. Обязательного runtime-gate нет: если установленная копия плагина в `<DSH_HOME>/plugins/opencode-local-bridge/` удалена или повреждена, Harness только запишет ошибку в журнал и продолжит работу без защиты. Проверяйте `/bridge-shell-status` после каждого запуска Harness, прежде чем возобновлять цель. Плагин добавляет `set -e -o pipefail`
+к Bash-командам: успешный `tail` больше не скрывает ошибку предыдущей части
+конвейера. По ненулевому результату foreground-команды, тайм-ауту или ошибке
+инструмента текущий ход останавливается штатным Stop, без запроса к модели для
+повтора или диагностики. История, завершённые действия и счётчики сохраняются.
+`if`, `!`, `&&` и `||` сохраняют обычную семантику Bash: явно обработанный
+ненулевой статус не обязательно означает сбой всей команды.
+
+Обычный `gh pr checks` (включая `--required`/`--repo`) читает статусы одним запросом и возвращает JSON: подтверждённые красные и ожидающие проверки не останавливают цель. При валидной схеме и пустом stderr код `0` означает успешное получение JSON, даже если проверки ещё `pending` или уже `fail`: их статусы сохраняются в ответе. Ненулевые коды `1`/`8` нормализуются только при согласованном статусе проверок. Ошибки сети/авторизации, повреждённый ответ и сбои остальных частей конвейера останавливают ход. Режимы `--watch`, `--web` и пользовательское форматирование сохраняют исходную семантику gh. Требуется `python3` в PATH; `/bridge-shell-status` должен показывать `harness-contract-v3`. Случай `pending` с кодом `0`, остановивший чтение проверок PR №80, исправлен и проверен офлайн по сохранённому JSON и на shell-конвейере; повторного запроса CI для проверки фикса не было. Это не означает, что сами CI-проверки прошли.
+
+При проверке наличия исправления в ветке, поиске необязательных маркеров или раздела отсутствие совпадений является результатом исследования, даже если заранее неизвестно, найдётся ли совпадение. Контракт модели требует выбирать `bridge_grep_optional` для такого поиска; обычный `grep` остаётся для обязательных утверждений. Для нескольких маркеров используйте `-E 'marker_a|marker_b'`. Ошибка источника (`git show` и др.) по-прежнему останавливает конвейер. Это правило выбора в подсказке, а не гарантия поведения модели; shell-защита не переопределяет обычный `grep`.
+
+Для поиска, где отсутствие совпадений допустимо, используйте функцию
+`bridge_grep_optional` вместо `grep`: она меняет на успех только код `1` самого
+поиска. Код `2` (ошибка шаблона/чтения) и отказ предыдущей команды сохраняются.
+Тихий режим (`-q`/`--quiet`/`--silent`) отклоняется с кодом `2`: при совпадении
+grep вернул бы `0`, даже если другой вход не прочитался. Используйте вывод `-c`
+или `-n`. Ранний выход (`-m`, `-l`) после большого источника даёт ему код `141`
+(SIGPIPE) — это сообщаемый сбой, его не нормализуют. Функция требует Bash
+(оба исполнителя Harness запускают `bash -c`); другой шелл останавливается с кодом `2`.
+Обычный `grep` не переопределяется — обязательные проверки наличия совпадения
+продолжают падать. Не добавляйте `|| true` ко всему конвейеру. Для ограничения
+вывода используйте `sed -n '1,40p'`, который дочитывает поток, вместо `head`.
+Офлайн проверены пустой поиск, совпадение, неверный шаблон, недоступный файл,
+ошибки источника с кодами `1`/`17` и продолжение/остановка в настоящем Harness.
+
+Плагин не анализирует текст вывода и не обещает перехватывать ошибки запущенных в фоне процессов.
+Для `gh` задаётся `XDG_CACHE_HOME` в отдельном временном каталоге с правами `0700`;
+авторизация и права песочницы не меняются. Старый кэш не удаляется. Новый кэш
+остаётся до очистки временных файлов ОС. Проверено офлайн в установленном Harness:
+ошибка конвейера прекращает оставшуюся команду и следующий вызов в пакете,
+второго запроса к модели нет; запись в кэш проходит.
+
+В последующей реальной проверке `gh run view --log-failed` успешно прочитал CI-лог.
+Следующий конвейер `gh api | grep | head` вернул код `1`; Harness автоматически
+показал Stopped и не отправил третью генерацию. Исходный поток до фильтра не
+сохранён, поэтому причина этого кода по результату инструмента не установлена.
+`grep` без совпадений также возвращает `1`: ожидаемый случай нужно явно обработать
+в самой команде, а не отключать защиту глобально. История и прежний учёт расхода
+сохранились; добавились только две генерации и два HTTP-запроса.
+
+После фикса необязательного поиска следующий реальный ход завершился без
+новых ошибок: пять вызовов инструментов прочитали сохранённый CI-лог и локальные
+исходники, без повторного скачивания и тестовых прогонов. Старый шаблон `grep`
+на сохранённом логе нашёл совпадение; это не доказывает причину прежнего статуса
+конвейера `gh api`. Сам CI-отчёт содержит новый относительно baseline отказ теста,
+но не его assertion traceback; исправление поиска не означает исправления CI.
+
+При разборе отдельного PowerShell-сбоя в тестовом проекте артефакт pytest
+подтвердил `TimeoutExpired` процесса через 10 секунд, а не ошибку assertion.
+После установки PowerShell 7.6.6 его тестовая фикстура разделяет ограниченный
+запуск (30 с) и выполнение проекции (10 с), без повторов и изменения baseline.
+Узкие проверки пройдены локально, включая воспроизведение задержки старта;
+это не подтверждение исправленного CI или нативной Windows-приёмки.
+
+В следующем ходе обнаружена отдельная граница протокола: модель вернула
+блок `calls` как текст. Harness показал Completed, но инструмент не исполнился.
+Теперь законченный верхнеуровневый `calls` разбирается как вариант `tool_calls`
+только для нормально завершённого ответа DeepSeek и с полной проверкой схемы.
+Аргументы не угадываются; повреждённый JSON, несколько блоков, цитируемый или
+вложенный код не исполняются. Неверный блок больше не считается успешным текстовым
+ответом. Офлайн проверены границы парсера и реальное исполнение в Harness с
+подставным провайдером. Однократное восстановление уже доставленного текста
+сохраняет ID ответа, историю и расход: новую генерацию не отправляет, счётчик
+ответов диалога не увеличивает, после инструмента возвращает локальную остановку.
+
+Реальное восстановление этого случая проверено: один сохранённый `bash`
+выполнен успешно, затем Harness получил локальную остановку. Новых генераций
+DeepSeek не было; файл бюджетов не изменился, прежние привязки истории сохранены,
+новая привязка использует тот же ID ответа и прежний счётчик диалога.
+
+Модель также получает указание
+не объединять запись с зависящей от неё проверкой. Это подсказка, не гарантия:
+если модель пропустит `file_path` или другое обязательное поле, пакет будет отклонён.
+Мост не выводит путь из содержимого или соседней команды и не запускает повтор
+автоматически.
+
+Промпт отделяет прошлую переписку от следующего ответа ассистента и запрещает
+модели сочинять результаты инструментов. Только Harness возвращает настоящий
+результат выполнения. Текст вроде `Tool (...):` после блока вызовов не обрезается:
+весь пакет отклоняется без выполнения. Эта подсказка снижает риск, но не гарантирует
+соблюдение формата моделью.
+
+Проверено офлайн на сохранённых ответах, без новой генерации. Фикс не возобновляет
+остановленную цель, не переигрывает старый ответ и не сбрасывает историю или счётчики.
+
+### Если Harness остановился
+
+| Сообщение / симптом | Что проверить |
+| --- | --- |
+| `Local request budget exhausted` | Локальные бюджеты, предел ответов одного диалога или размер промпта. Новый чат и перезапуск не обнуляют скользящий расход |
+| `MISSING_CREDENTIAL` для `deepseek-official` | Выбран официальный API, которому нужен ключ. Для моста выберите модель из **Local account bridge** |
+| `login_required` | Сохранённая сессия истекла; выполните вход для нужного провайдера |
+| `quota_exceeded`, `user is muted`, защитный отказ | Остановитесь и проверьте обычный сайт; не повторяйте запросы автоматически |
+| Нет группы или модели | Проверьте `.env`, работающий мост и `/v1/models`, затем повторите установку каталога |
+
+По умолчанию DeepSeek: **12/60 генераций, 3/6 новых чатов, 40/200 HTTP-запросов
+за час/сутки**, общий лимит 20 принятых ответов в одном диалоге
+(`CONVERSATION_MAX_REPLIES`). Интервал — 30 секунд. Бюджеты `DEEPSEEK_MAX_*` и
+`CONVERSATION_MAX_REPLIES` задаются в окружении процесса; увеличение локального
+потолка не увеличивает квоту сайта. [Настройка и разбор ошибок](docs/HARNESS.ru.md#локальные-лимиты-и-ошибки).
+
+## Подключение OpenCode
+
+Сервер и аккаунт настраиваются теми же шагами выше. Поместите
+[пример `opencode.json`](examples/opencode.json) в папку проекта. Если конфиг
+уже есть, объедините настройки, сохранив свои `provider`, `model` и `small_model`.
+Задавайте `small_model` явно: заголовки тоже могут расходовать сообщения.
+
+```bash
+cd /path/to/your-project
+opencode --agent plan --model local-qwen/qwen3.8-omni-flash
+```
+
+Для DeepSeek используйте `local-deepseek/deepseek-chat` или
+`local-deepseek/deepseek-expert`. Адрес API — `http://127.0.0.1:8000/v1`,
+`apiKey` — токен API моста, например `"{file:/абсолютный/путь/session/api-token}"`
+([Токен доступа к API](#токен-доступа-к-api)). Это не ключ аккаунта провайдера.
+[Агенты и плагин инструментов](docs/SETUP.ru.md#интеграция-с-opencode).
+
+## Что работает
+
+Сводка реализации и исторических проверок на **11 октября 2026**.
+Проверка конкретного аккаунта не гарантирует доступность сейчас или безотказность
+длинной автономной цели. Подробные результаты сохранены в документации провайдеров.
+
+| Провайдер / ID модели | Браузер во время запросов | Статус |
+| --- | --- | --- |
+| DeepSeek · `deepseek-chat`, `deepseek-expert` | Не нужен; первоначальный вход ручной | Безбраузерный HTTP; небольшие задачи Harness проходили; были повторные ограничения аккаунта. Автопродления нет |
+| Qwen · HTTP via `QWEN_MODELS` / `qwen-web` | HTTP: не нужен после входа; `qwen-web`: связанная вкладка | HTTP Flash/Max и браузерный адаптер проверены; у Max наблюдался дневной лимит. `qwen3.7-plus` в каталоге без отдельной живой проверки. [Сессия](docs/HARNESS.ru.md#сессия-qwen) |
+| Kimi · `kimi-instant` | Не нужен после сохранения сессии | Экспериментальный HTTP: ответ, обновление токенов и Harness `read` проверены |
+| Kimi · `kimi-k3`, `kimi-k2.8` | Не нужен после сохранения сессии | HTTP реализован, сквозная проверка не завершена: K3 отказал по нагрузке бесплатного доступа, K2.8 после отказа не запускали. [Подробности](docs/KIMI.md) |
+| Kimi · `kimi-web` | Нужна связанная вкладка | Браузерный адаптер проверен; длинная вставка (~4KB+, system+tools) на сайте уходит в TXT-вложение — подтверждено. См. `browser/README.md` и `.env.example` |
+| GLM · `glm-web` | Нужна связанная вкладка | Браузерный адаптер проверен; безбраузерный доступ к этой модели не завершён. [Ограничения](docs/GLM.md) |
+| Mistral · `mistral-web` | Нужна связанная вкладка | Браузерный адаптер проверен — см. `browser/README.md` |
+| Grok · `grok-web` | Нужна связанная вкладка | Браузерный адаптер проверен — см. `browser/README.md` |
+| ChatGPT · `chatgpt-web` | Нужна связанная вкладка | Браузерный адаптер проверен — см. `browser/README.md` |
+| Claude · `claude-web` | Нужна связанная вкладка | Браузерный адаптер проверен (ProseMirror + `/api/*`) — см. `browser/README.md` |
+| Gemini · `gemini-web` / Antigravity CLI | `gemini-web`: связанная вкладка; CLI: `agy` | Браузерный адаптер проверен. CLI в нашей проверке отклонялся по региону |)
+
+Все подключения выключены после чистой установки. Веб-версии, квоты и доступность
+могут меняться. Китайские модели тоже имеют ограничения; точный размер дневной
+квоты Qwen Max и время её сброса не установлены.
+
+## Как устроен мост
+
+![Harness или OpenCode → локальный мост → HTTP-сессия, вкладка или CLI](docs/media/bridge-architecture.svg)
+
+**Инструменты выполняет Harness или OpenCode на вашем компьютере.** Промпты и
+прочитанные инструментами данные уходят выбранному провайдеру. Мост проверяет
+ответы и `tool_calls`, сохраняет диалог и отправляет новые результаты инструментов
+в существующий чат. Неизвестная история останавливается, а не создаёт новый чат.
+
+Паузы при отказах сохраняются после перезапуска. Настройка клиента, обычный вход
+и сброс локального бюджета сами по себе их не снимают. Явный перенос через Safari
+может снять паузу авторизации после отказа на challenge, если нет неопределённой
+генерации; ограничения аккаунта и квоты он не снимает. Статус пауз:
+`python -m providers.access status`. [Правила возобновления](docs/ACCOUNT_SAFETY.md).
+
+API по умолчанию слушает `127.0.0.1` (только локально) и требует токен API
+моста. Для `HOST` вне loopback нужны `API_ALLOW_PUBLIC_BIND=1`,
+`API_ALLOWED_HOSTS` и межсетевой экран; без них API не открывайте. Сессии в `session/` и `.env` исключены из Git.
+Не публикуйте их, персональные Userscripts или токен управления бюджетом.
+Поддерживается текст и эмуляция вызовов инструментов; изображения, аудио и видео
+не загружаются, даже если модель называется Omni.
+
+Известные ограничения: observer браузерного моста работает в странице провайдера,
+поэтому скрипты, уже выполняющиеся в этом origin, могут подделать его события
+ответа; мост привязывает задание к вкладке, а не к аутентифицированному
+источнику ответа. Потоки DeepSeek/Qwen останавливаются после 300 секунд всего
+или 15 секунд без байтов; такая остановка ставит паузу провайдера и не
+повторяется. Первый запрос (ещё без ответа ассистента) не имеет ссылки истории,
+поэтому его повторная отправка может открыть второй чат; продолжения одноразовые.
+
+## Демонстрации OpenCode
+
+Исторические кадры OpenCode 1.18.34: чтение небольшого контрольного файла.
+Это **не интерфейс Harness** и не проверка текущей доступности аккаунтов.
+
+| Qwen Flash | Qwen Max |
+| --- | --- |
+| ![OpenCode Qwen Flash](docs/media/qwen-flash-opencode.png) | ![OpenCode Qwen Max](docs/media/qwen-max-opencode.png) |
+
+[Кадры GLM/Kimi и методика записи](docs/media/README.md).
+
+## Документация и разработка
+
+- [Harness: подключение, сессии, бюджеты, офлайн-проверка](docs/HARNESS.ru.md)
+- [Полная установка, OpenCode, API и автозапуск](docs/SETUP.ru.md)
+- [Kimi HTTP](docs/KIMI.md) · [GLM](docs/GLM.md) · [Safari Userscripts](browser/README.md)
+- [Безопасность аккаунтов](docs/ACCOUNT_SAFETY.md) · [Примеры API](examples/README.md)
+- [Терминальный чат DeepSeek](docs/TERMINAL_CHAT.md)
+
+CI проверяет Python 3.9/3.12, PoW WASM, shell/JavaScript и изолированные браузерные
+сценарии. Локально: `python -m unittest discover -s tests -t . -v`.
+[Сценарии настоящего Harness CLI с подменённым провайдером](docs/HARNESS.ru.md#проверка-без-аккаунтов).
+
+### Защита браузерного обмена
+
+DOM-fallback отключён: старый видимый ответ не может завершить новый запрос.
+Claude требует terminal marker сетевого потока; обрезанный по лимиту, частичный или повреждённый
+ответ не выдаётся как завершённый. При неопределённом исходе отправки остаются
+pending и защитная пауза, в том числе после перезапуска. Автоповтора нет.
+Исправления проверены офлайн; живые аккаунты не использовались. Для применения
+браузерных изменений заново экспортируйте и обновите userscripts (controller 0.3.34).
+
+Mistral принимает только привязанный к запросу поток с конечным trailer.
+Режим Harness `--without-browser` исключает браузерные модели и их алиасы.
+Браузерный контроллер ждёт завершения вставки текста, сохраняет изменения
+пользователя и продолжает только явно привязанный диалог. Эти сценарии проверены
+в 28 изолированных браузерных фикстурах без аккаунтов.
+
+### Идентификаторы моделей
+
+`GET /v1/models` показывает короткие имена и алиасы `провайдер/модель`: например,
+`qwen3.8-max` и `qwen/qwen3.8-max`, `deepseek-chat` и `deepseek/deepseek-chat`.
+Оба варианта принимаются API и каталогом Harness. Префикс должен соответствовать
+провайдеру; он не включает отключённую модель. Алиасы DeepSeek используют одну
+привязку истории и один учёт продолжения: смена написания не создаёт новый чат
+и не сбрасывает защиту от повторов. Проверено офлайн; это не проверка доступа
+к моделям аккаунта.
+
+### Контракт Harness: история и остановка
+
+Перед запросом к любому провайдеру мост проверяет историю tool calls: каждому
+вызову нужен ровно один результат с тем же ID; потерянные, повторные и чужие
+результаты отклоняются локально. Результаты параллельного пакета могут приходить
+в другом порядке. Проверка действует и при явном `conversation_id`; она не
+дописывает аргументы и не повторяет выполненные действия.
+
+Локальная shell-защита Harness снимает разрешение на автопродолжение цели
+**до** отмены хода при ошибке инструмента. Фаза и ревизия цели сохраняются;
+возобновление требует отдельного действия пользователя. Установка защиты:
+`python -m integrations.harness_shell_safety --profile desktop`, затем перезапуск
+Harness. `/bridge-shell-status` проверяет shell-настройки без отправки запроса;
+актуальная версия показывает `harness-contract-v2` и `goal disarm before native stop`.
+Переустановка моделей сохраняет эту защиту.
+
+Проверено офлайн на фикстурах контракта Harness 0.2.0-rc.2: SSE, точные ID
+вызовов, продолжение существующего диалога и отказ от повторного шага без
+изменения счётчиков. Это не живая проверка аккаунта и не гарантия завершения
+произвольной цели.
+
+### Автоперенос при исчерпании контекста
+
+`DEEPSEEK_CONTEXT_ROLLOVER=1` включает перенос в новый диалог DeepSeek внутри
+той же цели Harness. Требуется перезапуск моста. Только подтверждённый отказ
+`context_length_exceeded` с пустым очищенным ответом разрешает один перенос.
+Полная история сохраняется приватно в `session/context-checkpoints/`; модель
+получает исходные инструкции, реестр выполненных вызовов и выдержки результатов.
+Недостающие сведения доступны через `read` архива. Это не семантическое резюме.
+История Harness, расход и счётчик подтверждённых ответов сохраняются.
+При новой ошибке — остановка без повторов; старые паузы сами не снимаются.
+По умолчанию выключено. Проверено офлайн, без запросов к аккаунтам.
+[Условия и ограничения](docs/HARNESS.ru.md#исчерпан-контекст-диалога-deepseek).
+
+**MIT · неофициальный проект.** Основан на
+[Tsuev/opencode-deepseek](https://github.com/Tsuev/opencode-deepseek) и
+[sums001/Deepseek-API](https://github.com/sums001/Deepseek-API).
+Используйте аккаунты в рамках условий сервисов. [Лицензия](LICENSE).
+
+Браузерные адаптеры (userscripts, протокол вкладки, провайдеры ChatGPT / Claude /
+Gemini / Qwen / Kimi / GLM / Mistral / Grok и связанные проверки) переработаны в
+форке [SimolSem/opencode-deepseek](https://github.com/SimolSem/opencode-deepseek)
+и оттуда приходят сюда pull request'ами.
+
+Старые ветки для апстрима не означают недостающие функции: изменения
+`feat/browser-providers` сверены с `main`; функциональных потерь не найдено.
+[Таблица соответствия и отличия документации](docs/BRANCH_RECONCILIATION_20261012.md).
+Офлайн-тест установщика бюджета проверяет реальный импорт каталога моделей
+в изолированной копии и показывает исходную ошибку дочернего процесса.

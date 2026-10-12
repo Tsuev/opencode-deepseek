@@ -1,0 +1,63 @@
+{
+  "recorded_on": "2026-10-02",
+  "bridge_commit": "c9a1edef7d971b35ffb5961c72ac69bbf89f15ea",
+  "opencode_version": "1.18.34",
+  "agent": "plan",
+  "terminal": { "columns": 130, "rows": 24 },
+  "renderer": { "pyte": "0.8.2", "Pillow": "12.3.0" },
+  "fixture": {
+    "filename": "hello.py",
+    "sha256": "559f31b92e61d48f2c558e599a4cc28c40f79ea1b1f42bf65a5d301f236d3a7e",
+    "content": "def health_status():\n    return {\"status\": \"ok\"}\n"
+  },
+  "verification": {
+    "required_tool": "read",
+    "required_status": "completed",
+    "expected_final_answer": "health_status() returns {\"status\": \"ok\"}",
+    "trailing_period_optional": true,
+    "editing_shell_and_webfetch": "denied",
+    "capture_method": "Completed real OpenCode sessions reopened in the TUI without another model request; PTY cells rendered into PNGs",
+    "timings_are_benchmarks": false,
+    "displayed_cost_proves_unlimited_usage": false
+  },
+  "captures": [
+    {
+      "image": "qwen-flash-opencode.png",
+      "model": "local-qwen/qwen3.8-omni-flash",
+      "dimensions": [1360, 678],
+      "sha256": "4524c5bf637a5b9fa3f015c31cbbbb8bb7de2029916aa1ba82b06a6f6ee936a4",
+      "completed_native_read": true,
+      "expected_final_answer": true
+    },
+    {
+      "image": "qwen-max-opencode.png",
+      "model": "local-qwen/qwen3.8-max",
+      "dimensions": [1360, 678],
+      "sha256": "6256ab7c42359ee0bb922ae9cc911410f6a2cb861da2e49340cef66a5504b323",
+      "completed_native_read": true,
+      "expected_final_answer": true
+    },
+    {
+      "image": "glm-opencode.png",
+      "model": "local-glm/glm-web",
+      "dimensions": [1360, 678],
+      "sha256": "1b114d6ba69a5b2ff694d57f2dcc76dd0f73a3a8cfa573af524445c91bcbe118",
+      "completed_native_read": true,
+      "expected_final_answer": true
+    },
+    {
+      "image": "kimi-opencode.png",
+      "model": "local-kimi/kimi-web",
+      "dimensions": [1360, 678],
+      "sha256": "59a59961039d6b475d6f78a052b69ce0101773e864edb5ce727f476d16beb178",
+      "completed_native_read": true,
+      "expected_final_answer": true
+    }
+  ],
+  "unpublished_provider_results": {
+    "deepseek": "Current test account returned biz_code=5, biz_msg=user is muted; requests stopped",
+    "mistral": "Continuation reached an account allowance limit; no qualified agent capture",
+    "grok": "No completed bridge response captured",
+    "gemini": "Completion rejected by regional eligibility; disabled"
+  }
+}

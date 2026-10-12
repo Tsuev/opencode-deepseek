@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import List, Optional, Union
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from .config import DEFAULT_MODEL
 
@@ -14,12 +14,37 @@ class ChatMessage(BaseModel):
     # content is a plain string, or a list of parts (OpenAI vision-style). We only
     # read text parts; non-text parts are ignored.
     content: Union[str, List[dict], None] = None
-    # Tool-calling fields. DeepSeek's web protocol has no tool channel, so these
+    # Tool-calling fields. The web protocols have no OpenAI tool channel, so these
     # are accepted for OpenAI compatibility and emulated via prompt injection
     # (see server.openai_format).
     tool_calls: Optional[List[dict]] = None
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
+
+    @field_validator("content")
+    @classmethod
+    def validate_text_parts(cls, value):
+        if isinstance(value, list):
+            for part in value:
+                if part.get("type") == "text" and not isinstance(part.get("text", ""), str):
+                    raise ValueError("Text content parts must contain a string")
+        return value
+
+    @field_validator("tool_calls")
+    @classmethod
+    def validate_historical_calls(cls, value):
+        seen = set()
+        for call in value or []:
+            identity, fn = call.get("id"), call.get("function")
+            if (not isinstance(identity, str) or not identity or len(identity) > 256
+                    or identity in seen or call.get("type", "function") != "function"
+                    or not isinstance(fn, dict)
+                    or not isinstance(fn.get("name"), str) or not fn["name"]
+                    or len(fn["name"]) > 256
+                    or not isinstance(fn.get("arguments"), (str, dict))):
+                raise ValueError("Invalid historical tool call")
+            seen.add(identity)
+        return value
 
 
 class ChatCompletionRequest(BaseModel):
@@ -32,12 +57,12 @@ class ChatCompletionRequest(BaseModel):
     # pass these via extra_body: `thinking` (DeepThink), `search` (web).
     thinking: bool = False
     search: bool = False
-    # Function/tool calling (OpenAI format). DeepSeek's web chat has no native
+    # Function/tool calling (OpenAI format). These web chats have no OpenAI
     # tool channel, so we emulate it by injecting the tool specs into the prompt
     # and parsing the model's reply for a tool-call block.
     tools: Optional[List[dict]] = None
     tool_choice: Optional[Union[str, dict]] = None
-    # Accepted for compatibility but not all are forwarded to DeepSeek.
+    # Accepted for compatibility but not all are forwarded to the provider.
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     max_tokens: Optional[int] = None
