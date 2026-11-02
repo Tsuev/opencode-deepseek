@@ -15,8 +15,10 @@ Endpoints:
     POST /v1/chat/completions   (stream=true supported)
     GET  /healthz
 
-Requests under /v1 are rate limited per client IP (default 30/min, set via
-RATE_LIMIT_PER_MINUTE); /healthz is exempt.
+Requests under /v1 are rate limited per client IP (default 10/min, set via
+RATE_LIMIT_PER_MINUTE); /healthz is exempt. Upstream traffic is additionally
+paced, budgeted and paused on refusal by `server.safety`, and OpenAI clients
+reuse their DeepSeek conversation via `server.conversations`.
 
 Sessions expire. To survive that, this module:
   * rebuilds the shared client once and retries the request if DeepSeek rejects
@@ -37,7 +39,6 @@ import threading
 import time
 from contextlib import asynccontextmanager
 
-import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -47,6 +48,16 @@ from deepseek.auth import SESSION_MAX_AGE, LoginRequired, get_session
 from deepseek.client import DeepSeekClient, Reply
 
 from .config import (
+    CONVERSATION_MAX_ENTRIES,
+    CONVERSATION_REUSE,
+    CONVERSATION_TTL,
+    DEEPSEEK_COOLDOWN_SECONDS,
+    DEEPSEEK_JITTER,
+    DEEPSEEK_MAX_GENERATIONS_PER_DAY,
+    DEEPSEEK_MAX_GENERATIONS_PER_HOUR,
+    DEEPSEEK_MAX_NEW_CHATS_PER_DAY,
+    DEEPSEEK_MAX_NEW_CHATS_PER_HOUR,
+    DEEPSEEK_MIN_INTERVAL,
     MODEL_MAP,
     RATE_LIMIT_PER_MINUTE,
     REFRESH_BROWSER_CHANNEL,
@@ -57,6 +68,7 @@ from .config import (
     is_known_model,
     resolve_model_type,
 )
+from .conversations import ConversationStore
 from .openai_format import (
     completion_response,
     looks_truncated,
@@ -66,6 +78,15 @@ from .openai_format import (
     stream_chunks,
 )
 from .ratelimit import RateLimiter, install_rate_limit
+from .safety import (
+    ROOT as SAFETY_ROOT,
+    BudgetExceeded,
+    BudgetGuard,
+    Cooldown,
+    CooldownActive,
+    UpstreamGate,
+    classify_error,
+)
 from .schemas import ChatCompletionRequest
 
 load_dotenv()
@@ -77,20 +98,72 @@ _stop_refresh = threading.Event()
 
 _MISSING = object()
 
-# Substrings that mark a DeepSeek rejection as an auth/session problem (worth a
-# session refresh + one retry). Deliberately broad: we only retry once, so a
-# false positive costs a single extra attempt.
-_AUTH_HINTS = (
-    "auth", "unauthorized", "forbidden", "login", "token",
-    "session", "credential", "expired", "not signed",
+# Account-safety guards (see server/safety.py). They are process-wide because
+# the bridge shares one DeepSeek account and one session.
+_gate = UpstreamGate(DEEPSEEK_MIN_INTERVAL, DEEPSEEK_JITTER)
+_budget = BudgetGuard(
+    SAFETY_ROOT / "session" / "usage.json",
+    {
+        "chat": (DEEPSEEK_MAX_NEW_CHATS_PER_HOUR, DEEPSEEK_MAX_NEW_CHATS_PER_DAY),
+        "generation": (
+            DEEPSEEK_MAX_GENERATIONS_PER_HOUR,
+            DEEPSEEK_MAX_GENERATIONS_PER_DAY,
+        ),
+    },
+)
+_cooldown = Cooldown(
+    SAFETY_ROOT / "session" / "cooldown.json", DEEPSEEK_COOLDOWN_SECONDS
+)
+_conversations = ConversationStore(
+    SAFETY_ROOT / "session" / "conversations.json",
+    enabled=CONVERSATION_REUSE,
+    ttl=CONVERSATION_TTL,
+    max_entries=CONVERSATION_MAX_ENTRIES,
 )
 
 
 def _is_auth_error(exc: Exception) -> bool:
-    if isinstance(exc, httpx.HTTPStatusError):
-        return exc.response.status_code in (401, 403)
-    msg = str(exc).lower()
-    return any(h in msg for h in _AUTH_HINTS)
+    """Only auth failures are worth retrying after a session refresh.
+
+    A 403 is often DeepSeek's anti-automation refusal, not an expired token.
+    Retrying those is exactly what turns a temporary block into a longer one,
+    so classify_error() only reports ``auth`` for genuine token problems.
+    """
+    return classify_error(exc) == "auth"
+
+
+def _raise_if_refused(exc: Exception) -> None:
+    """Latch a local cooldown when DeepSeek refuses us for risk/rate reasons."""
+    kind = classify_error(exc)
+    if kind not in ("refusal", "rate_limit"):
+        return
+    reason = (
+        "rate limit" if kind == "rate_limit" else "possible automation check"
+    )
+    _cooldown.latch(reason)
+    if DEEPSEEK_COOLDOWN_SECONDS > 0:
+        detail = (
+            f"DeepSeek refused the request ({reason}). The bridge is paused "
+            f"locally for {DEEPSEEK_COOLDOWN_SECONDS}s to avoid turning a "
+            "temporary block into a longer one."
+        )
+    else:
+        detail = f"DeepSeek refused the request ({reason})."
+    raise CooldownActive(detail, retry_after=float(DEEPSEEK_COOLDOWN_SECONDS))
+
+
+def _gated_chat(client: DeepSeekClient, prompt: str,
+                req: ChatCompletionRequest, model_type):
+    """Run one generation behind the pacing gate and the cooldown check."""
+    with _gate.turn():
+        _cooldown.ensure()
+        return client.chat(
+            prompt, req.conversation_id, model_type, req.thinking, req.search
+        )
+
+
+def _remember(req: ChatCompletionRequest, conversation_id) -> None:
+    _conversations.remember(req, conversation_id)
 
 
 def _tool_names(tools) -> set:
@@ -165,19 +238,14 @@ async def _run_chat_with_retry(prompt: str, req: ChatCompletionRequest, model_ty
     auth error. Raises `LoginRequired` if the rebuilt session can't be resolved."""
     client = await run_in_threadpool(get_client)
     try:
-        return await run_in_threadpool(
-            client.chat, prompt, req.conversation_id,
-            model_type, req.thinking, req.search,
-        )
+        return await run_in_threadpool(_gated_chat, client, prompt, req, model_type)
     except Exception as e:
+        _raise_if_refused(e)
         if not _is_auth_error(e):
             raise
         print(f"[retry] DeepSeek rejected the session ({e}); refreshing...", flush=True)
         client = await run_in_threadpool(get_client, True)
-        return await run_in_threadpool(
-            client.chat, prompt, req.conversation_id,
-            model_type, req.thinking, req.search,
-        )
+        return await run_in_threadpool(_gated_chat, client, prompt, req, model_type)
 
 
 # A truncated tool reply is continued this many times before giving up. Each
@@ -198,19 +266,19 @@ async def _continue_reply(prev: Reply, req: ChatCompletionRequest, model_type):
 
     On resume the thread keeps its own model, so `model` is passed as None —
     matching the resume rule in `deepseek.client.stream`."""
+    cont_req = req.model_copy(update={"conversation_id": prev.conversation_id})
     client = await run_in_threadpool(get_client)
     try:
         return await run_in_threadpool(
-            client.chat, _CONTINUE_PROMPT, prev.conversation_id,
-            None, req.thinking, req.search,
+            _gated_chat, client, _CONTINUE_PROMPT, cont_req, None
         )
     except Exception as e:
+        _raise_if_refused(e)
         if not _is_auth_error(e):
             raise
         client = await run_in_threadpool(get_client, True)
         return await run_in_threadpool(
-            client.chat, _CONTINUE_PROMPT, prev.conversation_id,
-            None, req.thinking, req.search,
+            _gated_chat, client, _CONTINUE_PROMPT, cont_req, None
         )
 
 
@@ -234,6 +302,11 @@ async def _run_tool_chat(prompt: str, req: ChatCompletionRequest, model_type):
             f"{_MAX_CONTINUATIONS}); requesting continuation...",
             flush=True,
         )
+        try:
+            _budget.reserve(new_chat=False)
+        except BudgetExceeded as e:
+            print(f"[toolcalls] continuation skipped: {e}", flush=True)
+            break
         try:
             nxt = await _continue_reply(reply, req, model_type)
         except Exception as e:
@@ -264,7 +337,8 @@ def _sse_error(message: str, err_type: str = "server_error") -> str:
 _KEEPALIVE_SECONDS = 10.0
 
 
-async def _tool_stream(req: ChatCompletionRequest, prompt: str, model_type):
+async def _tool_stream(req: ChatCompletionRequest, prompt: str, model_type,
+                       cache_req: ChatCompletionRequest = None):
     """Stream a buffered tool-call reply without tripping the client's timeout.
 
     Tool calls are emulated by buffering the whole reply before parsing, which
@@ -284,10 +358,14 @@ async def _tool_stream(req: ChatCompletionRequest, prompt: str, model_type):
         except LoginRequired as e:
             yield _sse_error(str(e), "login_required")
             return
+        except (CooldownActive, BudgetExceeded) as e:
+            yield _sse_error(str(e), "rate_limit_error")
+            return
         except Exception as e:
             yield _sse_error(f"DeepSeek request failed: {e}")
             return
 
+        _remember(cache_req or req, reply.conversation_id)
         for frame in sse_frames(req.model, content, tool_calls, reply.conversation_id):
             yield frame
     finally:
@@ -296,32 +374,58 @@ async def _tool_stream(req: ChatCompletionRequest, prompt: str, model_type):
 
 
 def _stream_with_retry(client: DeepSeekClient, prompt: str,
-                       req: ChatCompletionRequest, model_type):
-    """Stream a plain-text completion, refreshing the session once if the very
-    first chunk fails with an auth error (before any bytes were sent)."""
-    stream = _open_stream(client, prompt, req, model_type)
-    it = iter(stream)
-    try:
-        first = next(it, _MISSING)
-    except Exception as e:
-        if not _is_auth_error(e):
-            raise
-        print(f"[retry] DeepSeek rejected the stream ({e}); refreshing...", flush=True)
-        try:
-            client = get_client(force_refresh=True)
-        except Exception as e2:
-            yield _sse_error(f"Session refresh failed: {e2}", "login_required")
-            return
-        stream = _open_stream(client, prompt, req, model_type)
-        it = iter(stream)
-        try:
-            first = next(it, _MISSING)
-        except Exception as e3:
-            yield _sse_error(f"DeepSeek request failed: {e3}")
-            return
+                       req: ChatCompletionRequest, model_type,
+                       cache_req: ChatCompletionRequest = None):
+    """Stream a plain-text completion behind the safety gate.
 
-    iterator = it if first is _MISSING else itertools.chain([first], it)
-    yield from stream_chunks(req.model, stream, iterator=iterator)
+    Refreshes the session once if the very first chunk fails with an auth error
+    (before any bytes were sent). The gate stays held for the whole stream, so
+    parallel requests cannot hammer the account.
+    """
+    try:
+        with _gate.turn():
+            _cooldown.ensure()
+            stream = _open_stream(client, prompt, req, model_type)
+            it = iter(stream)
+            try:
+                first = next(it, _MISSING)
+            except Exception as e:
+                _raise_if_refused(e)
+                if not _is_auth_error(e):
+                    raise
+                print(f"[retry] DeepSeek rejected the stream ({e}); refreshing...",
+                      flush=True)
+                try:
+                    client = get_client(force_refresh=True)
+                except Exception as e2:
+                    yield _sse_error(f"Session refresh failed: {e2}", "login_required")
+                    return
+                stream = _open_stream(client, prompt, req, model_type)
+                it = iter(stream)
+                try:
+                    first = next(it, _MISSING)
+                except Exception as e3:
+                    _raise_if_refused(e3)
+                    yield _sse_error(f"DeepSeek request failed: {e3}")
+                    return
+
+            iterator = it if first is _MISSING else itertools.chain([first], it)
+            yield from stream_chunks(req.model, stream, iterator=iterator)
+            _remember(cache_req or req, getattr(stream, "conversation_id", None))
+    except (CooldownActive, BudgetExceeded) as e:
+        yield _sse_error(str(e), "rate_limit_error")
+    except Exception as e:
+        kind = classify_error(e)
+        if kind in ("refusal", "rate_limit"):
+            reason = "rate limit" if kind == "rate_limit" else "possible automation check"
+            _cooldown.latch(reason)
+            yield _sse_error(
+                f"DeepSeek refused the request ({reason}). The bridge is paused "
+                "locally to avoid a longer block.",
+                "rate_limit_error",
+            )
+        else:
+            yield _sse_error(f"DeepSeek request failed: {e}")
 
 
 def _refresh_loop() -> None:
@@ -402,33 +506,72 @@ async def chat_completions(req: ChatCompletionRequest):
             status=404, err_type="model_not_found",
         )
 
+    # OpenAI clients cannot send our custom conversation_id, so recover it from
+    # the resent history. On a match, send only the new tail to DeepSeek instead
+    # of creating a new chat and re-pasting the whole transcript.
+    cache_req = req
+    effective_req = req
+    if CONVERSATION_REUSE and not req.conversation_id:
+        match = _conversations.match(req)
+        if match is not None:
+            recovered_id, tail = match
+            # Keep the current system prompt (it carries agent instructions and
+            # the tool-discipline plugin) but drop the already-known history.
+            system = [m for m in req.messages if m.role == "system"]
+            effective_req = req.model_copy(
+                update={
+                    "conversation_id": recovered_id,
+                    "messages": [*system, *tail],
+                }
+            )
+            print(
+                f"[conversations] resumed {recovered_id.split(':')[0]} "
+                f"({len(tail)} new message(s))",
+                flush=True,
+            )
+
+    is_new_chat = not effective_req.conversation_id
     # A thread's model is fixed when it's created, so on resume we ignore `model`
     # (the OpenAI SDK always sends one) and let the existing thread's model stand.
-    model_type = None if req.conversation_id else resolve_model_type(req.model)
-    prompt = messages_to_prompt(req.messages, req.tools, req.tool_choice)
+    model_type = resolve_model_type(req.model) if is_new_chat else None
+    prompt = messages_to_prompt(
+        effective_req.messages, effective_req.tools, effective_req.tool_choice
+    )
+
+    # Stop before touching the account when paused or over a local budget.
+    try:
+        _cooldown.ensure()
+        _budget.reserve(new_chat=is_new_chat)
+    except (CooldownActive, BudgetExceeded) as e:
+        return _error(str(e), status=429, err_type="rate_limit_error")
 
     # Tool calls are emulated by buffering the reply and parsing it, so we use the
     # non-streaming call and then emit SSE frames when the client asked to stream.
     # That also lets us retry on an auth error and still return a clean status.
-    if req.tools:
-        if req.stream:
+    if effective_req.tools:
+        if effective_req.stream:
             return StreamingResponse(
-                _tool_stream(req, prompt, model_type),
+                _tool_stream(effective_req, prompt, model_type, cache_req),
                 media_type="text/event-stream",
             )
         try:
-            reply, content, tool_calls = await _run_tool_chat(prompt, req, model_type)
+            reply, content, tool_calls = await _run_tool_chat(
+                prompt, effective_req, model_type
+            )
         except LoginRequired as e:
             return _error(str(e), status=503, err_type="login_required")
+        except (CooldownActive, BudgetExceeded) as e:
+            return _error(str(e), status=429, err_type="rate_limit_error")
         except Exception as e:
             return _error(f"DeepSeek request failed: {e}")
 
+        _remember(cache_req, reply.conversation_id)
         return completion_response(
-            req.model, content, prompt, reply.conversation_id, tool_calls
+            effective_req.model, content, prompt, reply.conversation_id, tool_calls
         )
 
     # Plain chat: real incremental streaming, or a buffered retryable call.
-    if req.stream:
+    if effective_req.stream:
         try:
             client = await run_in_threadpool(get_client)
         except LoginRequired as e:
@@ -437,15 +580,22 @@ async def chat_completions(req: ChatCompletionRequest):
             return _error(f"Failed to initialise DeepSeek session: {e}")
 
         def gen():
-            yield from _stream_with_retry(client, prompt, req, model_type)
+            yield from _stream_with_retry(
+                client, prompt, effective_req, model_type, cache_req
+            )
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
     try:
-        reply = await _run_chat_with_retry(prompt, req, model_type)
+        reply = await _run_chat_with_retry(prompt, effective_req, model_type)
     except LoginRequired as e:
         return _error(str(e), status=503, err_type="login_required")
+    except (CooldownActive, BudgetExceeded) as e:
+        return _error(str(e), status=429, err_type="rate_limit_error")
     except Exception as e:
         return _error(f"DeepSeek request failed: {e}")
 
-    return completion_response(req.model, reply.text, prompt, reply.conversation_id)
+    _remember(cache_req, reply.conversation_id)
+    return completion_response(
+        effective_req.model, reply.text, prompt, reply.conversation_id
+    )

@@ -2,8 +2,59 @@
 
 import os
 
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
 # Requests per minute allowed per client IP (override with RATE_LIMIT_PER_MINUTE).
-RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "30"))
+RATE_LIMIT_PER_MINUTE = _env_int("RATE_LIMIT_PER_MINUTE", 10)
+
+# --- Account-safety guards (see server/safety.py) --------------------------
+# Minimum gap between upstream generations, plus random jitter. This is the
+# main defence against a burst looking like automation. Set to 0 to disable.
+DEEPSEEK_MIN_INTERVAL = _env_float("DEEPSEEK_MIN_INTERVAL", 15.0)
+DEEPSEEK_JITTER = _env_float("DEEPSEEK_JITTER", 5.0)
+
+# Rolling local budgets. New chats and generations are tracked separately so a
+# runaway agent loop stops locally before DeepSeek blocks the account.
+DEEPSEEK_MAX_NEW_CHATS_PER_HOUR = _env_int("DEEPSEEK_MAX_NEW_CHATS_PER_HOUR", 6)
+DEEPSEEK_MAX_NEW_CHATS_PER_DAY = _env_int("DEEPSEEK_MAX_NEW_CHATS_PER_DAY", 20)
+DEEPSEEK_MAX_GENERATIONS_PER_HOUR = _env_int("DEEPSEEK_MAX_GENERATIONS_PER_HOUR", 30)
+DEEPSEEK_MAX_GENERATIONS_PER_DAY = _env_int("DEEPSEEK_MAX_GENERATIONS_PER_DAY", 200)
+
+# After a 403/429 refusal, refuse all upstream calls for this long (seconds).
+# Set to 0 to disable the cooldown.
+DEEPSEEK_COOLDOWN_SECONDS = _env_int("DEEPSEEK_COOLDOWN_SECONDS", 3600)
+
+# Reuse an existing DeepSeek conversation when an OpenAI client resends its
+# history, instead of creating a new chat on every turn.
+CONVERSATION_REUSE = _env_bool("CONVERSATION_REUSE", True)
+CONVERSATION_TTL = _env_int("CONVERSATION_TTL", 24 * 60 * 60)
+CONVERSATION_MAX_ENTRIES = _env_int("CONVERSATION_MAX_ENTRIES", 500)
 
 # When the server has no session, should it pop a visible browser window for
 # interactive sign-in (the first request then blocks until you finish logging

@@ -69,6 +69,11 @@ class Session:
     cookies: Dict[str, str]
     user_agent: str
     captured_at: float
+    # Browser client hints captured at sign-in. Sent back on API calls so every
+    # bridge instance does not share the same hardcoded fingerprint. ``None``
+    # means "omit the header" (e.g. for sessions captured by an older version).
+    locale: Optional[str] = None
+    timezone_offset: Optional[int] = None
 
     @property
     def age(self) -> float:
@@ -103,6 +108,20 @@ _READ_TOKEN_JS = """
 }
 """
 
+# Capture the same client hints the real web app sends. Hardcoding these values
+# makes every bridge user share one fingerprint; deriving them from the signed-in
+# browser keeps the requests consistent with the session that created them.
+_READ_CLIENT_HINTS_JS = """
+() => {
+  try {
+    const locale = (navigator.language || 'en_US').replace(/-/g, '_');
+    // getTimezoneOffset() is minutes *behind* UTC; DeepSeek sends seconds east.
+    const offset = -new Date().getTimezoneOffset() * 60;
+    return { locale: locale, timezone_offset: offset };
+  } catch (e) { return {}; }
+}
+"""
+
 
 def _safe_evaluate(page, js: str):
     """Run page.evaluate, swallowing the benign 'Execution context was destroyed'
@@ -125,7 +144,16 @@ def _capture_from_context(context, page) -> Optional[Session]:
         return None
     cookies = {c["name"]: c["value"] for c in context.cookies()}
     ua = _safe_evaluate(page, "() => navigator.userAgent") or ""
-    return Session(token=token, cookies=cookies, user_agent=ua, captured_at=time.time())
+    hints = _safe_evaluate(page, _READ_CLIENT_HINTS_JS) or {}
+    offset = hints.get("timezone_offset")
+    return Session(
+        token=token,
+        cookies=cookies,
+        user_agent=ua,
+        captured_at=time.time(),
+        locale=hints.get("locale"),
+        timezone_offset=int(offset) if isinstance(offset, (int, float)) else None,
+    )
 
 
 def _wait_for_token(page, timeout: float) -> Optional[str]:

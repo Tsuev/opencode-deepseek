@@ -22,6 +22,7 @@ session (see `deepseek.auth`). For each message it:
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 from dataclasses import dataclass
@@ -103,20 +104,30 @@ class DeepSeekClient:
         )
 
     def _base_headers(self) -> dict:
-        return {
+        app_version = os.getenv("DEEPSEEK_APP_VERSION", "2.0.0")
+        headers = {
             "authorization": f"Bearer {self.session.token}",
             "accept": "*/*",
             "content-type": "application/json",
             "user-agent": self.session.user_agent,
             "origin": BASE,
             "referer": f"{BASE}/",
-            "x-app-version": "2.0.0",
-            "x-client-version": "2.0.0",
+            "x-app-version": app_version,
+            "x-client-version": app_version,
             "x-client-platform": "web",
-            "x-client-locale": "en_US",
             "x-client-bundle-id": "com.deepseek.chat",
-            "x-client-timezone-offset": "19800",
         }
+        # Only send client hints we actually captured from the signed-in browser.
+        # Sending a hardcoded locale/timezone makes every bridge user share the
+        # same (and usually wrong) fingerprint.
+        if self.session.locale:
+            headers["x-client-locale"] = self.session.locale
+            headers["accept-language"] = self.session.locale.replace("_", "-")
+        if self.session.timezone_offset is not None:
+            headers["x-client-timezone-offset"] = str(
+                int(self.session.timezone_offset)
+            )
+        return headers
 
     # --- protocol steps -----------------------------------------------------
 

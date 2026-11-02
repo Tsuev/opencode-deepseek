@@ -10,6 +10,16 @@ payment**.
 > This is an unofficial project, not affiliated with DeepSeek. You use your
 > regular DeepSeek account and are responsible for complying with its terms.
 
+> [!WARNING]
+> **Account-block risk.** The bridge drives your regular **DeepSeek web
+> account**, not the official API. DeepSeek's anti-fraud system may treat an
+> agent's traffic as automation and temporarily block the account — multi-day
+> blocks have been reported after only 4–5 rapid requests. This risk cannot be
+> eliminated. The built-in pacing, quotas and cooldown reduce the chance but do
+> not guarantee protection. For reliable daily use, use the official DeepSeek
+> API with a key and do not run large agent sessions on your main account. See
+> [Account safety](#account-safety) for details.
+
 ---
 
 ## Contents
@@ -23,6 +33,7 @@ payment**.
 - [opencode integration](#opencode-integration)
 - [Switching models, DeepThink and web search](#switching-models-deepthink-and-web-search)
 - [Environment variables](#environment-variables)
+- [Account safety](#account-safety)
 - [Limitations and important caveats](#limitations-and-important-caveats)
 - [Maintenance and troubleshooting](#maintenance-and-troubleshooting)
 - [Project structure](#project-structure)
@@ -521,7 +532,18 @@ File `.env` (a copy of `.env.example`):
 | --- | --- | --- |
 | `HOST` | `127.0.0.1` | Listen address |
 | `PORT` | `8000` | Port |
-| `RATE_LIMIT_PER_MINUTE` | `30` | Requests/min per client IP (`/healthz` not counted) |
+| `RATE_LIMIT_PER_MINUTE` | `10` | Requests/min per client IP (`/healthz` not counted) |
+| `DEEPSEEK_MIN_INTERVAL` | `15` | Minimum gap between DeepSeek requests, sec |
+| `DEEPSEEK_JITTER` | `5` | Random extra delay (0..N sec) so the cadence is not periodic |
+| `DEEPSEEK_MAX_NEW_CHATS_PER_HOUR` | `6` | Local ceiling on new DeepSeek chats per hour |
+| `DEEPSEEK_MAX_NEW_CHATS_PER_DAY` | `20` | Local ceiling on new chats per day |
+| `DEEPSEEK_MAX_GENERATIONS_PER_HOUR` | `30` | Local ceiling on generations per hour |
+| `DEEPSEEK_MAX_GENERATIONS_PER_DAY` | `200` | Local ceiling on generations per day |
+| `DEEPSEEK_COOLDOWN_SECONDS` | `3600` | Pause after a DeepSeek refusal (`403`/`429`), sec |
+| `CONVERSATION_REUSE` | `1` | Resume an existing conversation instead of creating a chat per agent step |
+| `CONVERSATION_TTL` | `86400` | How long a history-to-conversation mapping is kept, sec |
+| `CONVERSATION_MAX_ENTRIES` | `500` | Maximum stored histories |
+| `DEEPSEEK_APP_VERSION` | `2.0.0` | Web client version sent in headers; update if the site changes |
 | `DEEPSEEK_PROFILE_DIR` | — | Reuse an existing Chrome profile with an active session |
 | `SERVER_INTERACTIVE_LOGIN` | `1` | Open a browser window when there is no session; `0` — return `503` (for headless) |
 | `SESSION_REFRESH_ENABLED` | `1` | Background session refresh |
@@ -536,6 +558,82 @@ Example:
 ```bash
 HOST=0.0.0.0 PORT=8080 RATE_LIMIT_PER_MINUTE=60 python app.py
 ```
+
+---
+
+## Account safety
+
+The bridge drives a regular **web account**, not the official API. DeepSeek's
+anti-fraud system can mistake an agent's request burst for automation and
+temporarily block the account — multi-day blocks have been reported after only
+4–5 rapid requests. This risk cannot be eliminated: it is inherent to the
+approach, not a bug that can simply be patched. The official API with a key is
+the only option without this risk.
+
+### Why it happens
+
+DeepSeek does not see "opencode"; it sees HTTP requests to its internal web-chat
+API. Its anti-fraud heuristics (the exact set is not public) typically react to a
+combination of signals:
+
+- **High, regular frequency.** An agent fires requests back to back without the
+  pauses a human would make.
+- **A stream of new chats.** A regular OpenAI client cannot send our custom
+  `conversation_id`, so without extra logic every agent step would create a new
+  conversation — one of the clearest bot signals.
+- **Mismatched fingerprint.** The same locale, timezone and client version for
+  every user looks suspicious.
+- **Massive automated prompts.** Large system prompts with tool definitions and
+  machine-generated tool-call blocks.
+- **Retries after a refusal.** Retrying `403`/`429` can turn a temporary limit
+  into a long block.
+
+### What the bridge already does
+
+- **Spacing.** `DEEPSEEK_MIN_INTERVAL` plus random `DEEPSEEK_JITTER`; requests
+  run strictly one at a time and parallel agents queue (`server/safety.py`,
+  `UpstreamGate`).
+- **Local quotas.** `DEEPSEEK_MAX_*` caps new chats and generations per
+  hour/day. Counters persist in `session/usage.json` across restarts
+  (`BudgetGuard`). When a quota is exhausted the bridge returns a local `429`
+  without touching DeepSeek.
+- **Stop on refusal.** The first `403`/`429` latches a
+  `DEEPSEEK_COOLDOWN_SECONDS` pause (one hour by default) and the bridge stops
+  touching the account. The pause persists in `session/cooldown.json`; delete
+  that file to clear it manually (`Cooldown`). There are no automatic retries
+  after a refusal.
+- **Conversation reuse.** Instead of a new chat on every agent step, the bridge
+  finds the previous conversation from the resent history and sends only new
+  messages (`server/conversations.py`). This removes the clearest automation
+  signal — a stream of brand-new chats — and saves context too.
+- **Honest fingerprint.** Locale, `accept-language` and timezone are captured
+  from the browser at sign-in (`deepseek/auth.py`) instead of being hardcoded
+  identically for every user. The client version can be updated via
+  `DEEPSEEK_APP_VERSION`.
+
+### What you should do
+
+- Run **one agent/session at a time**; parallel sessions only increase risk.
+- Do not raise `DEEPSEEK_MAX_*` or `RATE_LIMIT_PER_MINUTE`, and do not lower
+  `DEEPSEEK_MIN_INTERVAL`, unless you really need to: the defaults balance
+  safety and speed.
+- Use a **separate account** for experiments and large tasks, not your main one.
+- After `403`/`429` **do not restart a request loop** and do not delete
+  `session/cooldown.json` immediately — wait for the pause to expire.
+- For reliable daily use, switch to the official DeepSeek API (paid key). The
+  bridge is then unnecessary and account blocks do not apply.
+
+### If the account is blocked anyway
+
+1. Stop the bridge and every agent that talks to it.
+2. Do not create new sessions or try to bypass the block with the same account.
+3. Wait for the block to expire (usually several days).
+4. After it is lifted, start with conservative settings and one agent.
+5. If it happens again, use the official API or another account.
+
+> **Responsibility.** This is an unofficial project and it does not guarantee
+> that blocks will never happen. By using a web account for automation you
+> accept this risk and remain responsible for complying with DeepSeek's terms.
 
 ---
 
@@ -557,10 +655,13 @@ HOST=0.0.0.0 PORT=8080 RATE_LIMIT_PER_MINUTE=60 python app.py
 - **Vision is not supported** (no image upload).
 - **Conversation id.** `conversation_id` fixes the model when a thread is
   created; on continuation `model` is ignored.
-- **Rate limit.** On `429`, use exponential backoff — the official `openai` SDK
-  does this automatically.
+- **Rate limit.** A local `429` (quota, cooldown, or `RATE_LIMIT_PER_MINUTE`)
+  means "wait", not "retry immediately". The official `openai` SDK backs off
+  automatically, but with `DEEPSEEK_COOLDOWN_SECONDS` retries stay useless
+  until the pause expires.
 - **Don't hammer the account.** This is your regular DeepSeek account; mass
-  automated requests may get it blocked.
+  automated requests may get it blocked. The built-in pacing and quotas are a
+  safety net, not permission to raise the limits without need.
 
 ---
 
@@ -594,7 +695,10 @@ The fallback to `chrome` is on by default. Keep
 
 **`429 Too Many Requests`**
 
-Raise `RATE_LIMIT_PER_MINUTE` and/or add retries with backoff.
+Read the error text first. A local quota or cooldown means wait (see
+`session/usage.json` and `session/cooldown.json`) and do not restart a request
+loop. If it is `RATE_LIMIT_PER_MINUTE`, raise it cautiously. Backoff retries
+only help with transient network errors; they do not clear the local pause.
 
 **Port in use**
 
