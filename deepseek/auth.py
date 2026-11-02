@@ -166,7 +166,14 @@ def _wait_for_token(page, timeout: float) -> Optional[str]:
         token = _safe_evaluate(page, _READ_TOKEN_JS)
         if token:
             return token
-        page.wait_for_timeout(1000)
+        try:
+            page.wait_for_timeout(1000)
+        except Exception as e:
+            # The user closed the login window; report a timeout rather than a
+            # Playwright traceback.
+            if "clos" in str(e).lower():
+                return None
+            raise
     return None
 
 
@@ -184,7 +191,16 @@ def _launch_context(p, profile_dir: Path, headless: bool, channel: Optional[str]
         kwargs["channel"] = channel
     try:
         return p.chromium.launch_persistent_context(str(profile_dir), **kwargs)
-    except Exception:
+    except Exception as e:
+        if not channel:
+            raise
+        print(
+            f"[auth] could not launch channel={channel!r} "
+            f"({type(e).__name__}); falling back to bundled Chromium. "
+            "Bundled Chromium is more likely to trigger a human-check — "
+            "installing Google Chrome is recommended.",
+            flush=True,
+        )
         kwargs.pop("channel", None)
         return p.chromium.launch_persistent_context(str(profile_dir), **kwargs)
 
@@ -214,37 +230,38 @@ def login(
     and saves the session. The persistent profile means later `get_session()`
     calls capture the token headlessly without a window.
 
-    `assume_logged_out=True` skips the initial "are we already signed in?" hop to
-    CHAT_URL and goes straight to the sign-in page. Callers that have just
-    confirmed there's no token (e.g. get_session after a failed headless refresh)
-    pass this so the window doesn't visibly bounce CHAT_URL -> SIGNIN_URL."""
+    Navigate exactly once, then let the website and the user finish signing in.
+    A missing token can mean a human-check is still in progress, so a second
+    navigation to /sign_in would interrupt it and can cause an endless hCaptcha
+    loop. ``assume_logged_out=True`` only selects SIGNIN_URL as the initial
+    destination; it does not add another navigation."""
     profile_dir.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as p:
         context = _launch_context(p, profile_dir, headless, channel)
         page = context.pages[0] if context.pages else context.new_page()
 
-        # Normally we first land on CHAT_URL to reuse an already-signed-in
-        # profile. When the caller already knows we're logged out, skip straight
-        # to the sign-in page so the window doesn't appear to "refresh".
-        existing = None
-        if not assume_logged_out:
-            _safe_goto(page, CHAT_URL)
-            existing = page.evaluate(_READ_TOKEN_JS)
+        try:
+            # One navigation only. On a fresh profile DeepSeek itself may
+            # redirect CHAT_URL to the sign-in page; an extra goto() would reset
+            # any human-check the user is currently solving.
+            _safe_goto(page, SIGNIN_URL if assume_logged_out else CHAT_URL)
+            existing = _safe_evaluate(page, _READ_TOKEN_JS)
 
-        if not existing:
-            _safe_goto(page, SIGNIN_URL)
-            print("[auth] Please sign in in the window (solve the human-check if "
-                  "shown). Waiting for the session...")
-            if not _wait_for_token(page, timeout=300):
-                context.close()
-                raise RuntimeError("Login timed out — no token captured.")
+            if not existing:
+                print("[auth] Please sign in in this window (use the website's "
+                      "sign-in button if needed). Complete any human-check "
+                      "manually; this helper will not navigate again. "
+                      "Waiting for the session...")
+                if not _wait_for_token(page, timeout=300):
+                    raise RuntimeError("Login timed out — no token captured.")
 
-        session = _capture_from_context(context, page)
-        context.close()
-        if session is None:
-            raise RuntimeError("Logged in but could not read the token.")
-        session.save()
-        return session
+            session = _capture_from_context(context, page)
+            if session is None:
+                raise RuntimeError("Logged in but could not read the token.")
+            session.save()
+            return session
+        finally:
+            context.close()
 
 
 def _headless_refresh(

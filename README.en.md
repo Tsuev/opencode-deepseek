@@ -676,6 +676,29 @@ python -m deepseek.auth   # log in again
 Make sure `SERVER_INTERACTIVE_LOGIN=0` on a headless deployment, and that the
 login window was completed beforehand.
 
+**hCaptcha loops forever / "try again"**
+
+Since this version, `python -m deepseek.auth` performs **exactly one
+navigation** to the sign-in flow and does not navigate again. Previously the
+helper opened `chat.deepseek.com`, waited 2 seconds and, when no token was
+visible yet, navigated to `/sign_in` — that could interrupt an in-progress
+hCaptcha check and restart it.
+
+What to do:
+
+1. Run `python -m deepseek.auth` and solve the challenge **in that same
+   window**. Do not reload the page or close the window.
+2. If the page shows a sign-in button, click it yourself; the helper
+   deliberately does not add extra navigations.
+3. Wait for completion: manual sign-in is given up to 5 minutes.
+4. If the loop persists: close the window, make sure no other Chrome/Chromium
+   instance is using `DEEPSEEK_PROFILE_DIR`, and try again. By default the
+   installed Chrome is used instead of bundled Chromium, which looks less like
+   automation.
+5. Do not try to solve hCaptcha programmatically: it is not supported and
+   increases the risk of an account block. If the check keeps failing, wait and
+   try again later.
+
 **`Playwright Sync API inside the asyncio loop`**
 
 Don't call sync Playwright from the event loop — the bridge already wraps calls
