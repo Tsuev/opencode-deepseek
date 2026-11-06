@@ -34,7 +34,9 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+import base64
 import os
+import tempfile
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -71,6 +73,7 @@ from .config import (
 from .conversations import ConversationStore
 from .openai_format import (
     completion_response,
+    image_sources,
     looks_truncated,
     messages_to_prompt,
     parse_tool_calls,
@@ -153,13 +156,72 @@ def _raise_if_refused(exc: Exception) -> None:
 
 
 def _gated_chat(client: DeepSeekClient, prompt: str,
-                req: ChatCompletionRequest, model_type):
+                req: ChatCompletionRequest, model_type, ref_file_ids=None):
     """Run one generation behind the pacing gate and the cooldown check."""
     with _gate.turn():
         _cooldown.ensure()
         return client.chat(
-            prompt, req.conversation_id, model_type, req.thinking, req.search
+            prompt, req.conversation_id, model_type, req.thinking, req.search,
+            ref_file_ids=ref_file_ids,
         )
+
+
+def _materialize_image(source: str) -> str:
+    """Write a data URL or download an http(s) image into a temp file."""
+    suffix = ".png"
+    payload = source
+    if source.startswith("data:"):
+        header, payload = source.split(",", 1)
+        mime = header.split(";", 1)[0].split(":", 1)[-1]
+        suffix = "." + (mime.split("/")[-1] or "png").replace("jpeg", "jpg")
+        raw = base64.b64decode(payload) if ";base64" in header else payload.encode()
+    elif source.startswith(("http://", "https://")):
+        import httpx
+        response = httpx.get(source, timeout=30, follow_redirects=True)
+        response.raise_for_status()
+        raw = response.content
+        suffix = os.path.splitext(source.split("?", 1)[0])[1] or ".png"
+    else:
+        path = os.path.abspath(source)
+        if not os.path.isfile(path):
+            raise ValueError(f"Image source is not a readable file or URL: {source[:120]}")
+        return path
+    fd, path = tempfile.mkstemp(prefix="deepseek-image-", suffix=suffix)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(raw)
+    return path
+
+
+def _image_sources(req: ChatCompletionRequest) -> list[str]:
+    result = []
+    for message in req.messages:
+        result.extend(image_sources(message.content))
+    return result
+
+
+async def _upload_images(req: ChatCompletionRequest) -> tuple[list[str], list[str]]:
+    sources = _image_sources(req)
+    if not sources:
+        return [], []
+    paths = await asyncio.gather(*(
+        run_in_threadpool(_materialize_image, source) for source in sources
+    ))
+    client = await run_in_threadpool(get_client)
+    ids = []
+    try:
+        for path in paths:
+            ids.append(await run_in_threadpool(client.upload_file, path))
+    except Exception:
+        for path in paths:
+            if path.startswith(tempfile.gettempdir()) and os.path.isfile(path):
+                os.unlink(path)
+        raise
+    # DeepSeek has already stored and processed the uploads; do not leave
+    # OpenCode's base64 payloads on disk.
+    for path in paths:
+        if path.startswith(tempfile.gettempdir()) and os.path.isfile(path):
+            os.unlink(path)
+    return ids, []
 
 
 def _remember(req: ChatCompletionRequest, conversation_id) -> None:
@@ -233,19 +295,20 @@ def reset_client() -> None:
         _client = None
 
 
-async def _run_chat_with_retry(prompt: str, req: ChatCompletionRequest, model_type):
+async def _run_chat_with_retry(prompt: str, req: ChatCompletionRequest, model_type,
+                               ref_file_ids=None):
     """Run a full (non-streaming) completion, refreshing the session once on an
     auth error. Raises `LoginRequired` if the rebuilt session can't be resolved."""
     client = await run_in_threadpool(get_client)
     try:
-        return await run_in_threadpool(_gated_chat, client, prompt, req, model_type)
+        return await run_in_threadpool(_gated_chat, client, prompt, req, model_type, ref_file_ids)
     except Exception as e:
         _raise_if_refused(e)
         if not _is_auth_error(e):
             raise
         print(f"[retry] DeepSeek rejected the session ({e}); refreshing...", flush=True)
         client = await run_in_threadpool(get_client, True)
-        return await run_in_threadpool(_gated_chat, client, prompt, req, model_type)
+        return await run_in_threadpool(_gated_chat, client, prompt, req, model_type, ref_file_ids)
 
 
 # A truncated tool reply is continued this many times before giving up. Each
@@ -261,7 +324,8 @@ _CONTINUE_PROMPT = (
 )
 
 
-async def _continue_reply(prev: Reply, req: ChatCompletionRequest, model_type):
+async def _continue_reply(prev: Reply, req: ChatCompletionRequest, model_type,
+                          ref_file_ids=None):
     """Resume the same DeepSeek thread and return the next slice of the reply.
 
     On resume the thread keeps its own model, so `model` is passed as None —
@@ -270,7 +334,7 @@ async def _continue_reply(prev: Reply, req: ChatCompletionRequest, model_type):
     client = await run_in_threadpool(get_client)
     try:
         return await run_in_threadpool(
-            _gated_chat, client, _CONTINUE_PROMPT, cont_req, None
+            _gated_chat, client, _CONTINUE_PROMPT, cont_req, None, ref_file_ids
         )
     except Exception as e:
         _raise_if_refused(e)
@@ -278,11 +342,12 @@ async def _continue_reply(prev: Reply, req: ChatCompletionRequest, model_type):
             raise
         client = await run_in_threadpool(get_client, True)
         return await run_in_threadpool(
-            _gated_chat, client, _CONTINUE_PROMPT, cont_req, None
+            _gated_chat, client, _CONTINUE_PROMPT, cont_req, None, ref_file_ids
         )
 
 
-async def _run_tool_chat(prompt: str, req: ChatCompletionRequest, model_type):
+async def _run_tool_chat(prompt: str, req: ChatCompletionRequest, model_type,
+                         ref_file_ids=None):
     """Full completion for a tool request, transparently continuing truncations.
 
     DeepSeek's web output limit can cut a large `write`/`edit` tool call off
@@ -291,7 +356,7 @@ async def _run_tool_chat(prompt: str, req: ChatCompletionRequest, model_type):
     from where it stopped, concatenating slices until the call parses. Returns
     `(reply, content, tool_calls)`."""
     names = _tool_names(req.tools)
-    reply = await _run_chat_with_retry(prompt, req, model_type)
+    reply = await _run_chat_with_retry(prompt, req, model_type, ref_file_ids)
 
     for attempt in range(_MAX_CONTINUATIONS):
         content, tool_calls = parse_tool_calls(reply.text, allowed_names=names)
@@ -308,7 +373,7 @@ async def _run_tool_chat(prompt: str, req: ChatCompletionRequest, model_type):
             print(f"[toolcalls] continuation skipped: {e}", flush=True)
             break
         try:
-            nxt = await _continue_reply(reply, req, model_type)
+            nxt = await _continue_reply(reply, req, model_type, ref_file_ids)
         except Exception as e:
             print(f"[toolcalls] continuation failed: {e}", flush=True)
             break
@@ -320,10 +385,12 @@ async def _run_tool_chat(prompt: str, req: ChatCompletionRequest, model_type):
     return reply, content, tool_calls
 
 
-def _open_stream(client: DeepSeekClient, prompt: str, req: ChatCompletionRequest, model_type):
+def _open_stream(client: DeepSeekClient, prompt: str, req: ChatCompletionRequest,
+                 model_type, ref_file_ids=None):
     return client.stream(
         prompt, conversation_id=req.conversation_id,
         model=model_type, thinking=req.thinking, search=req.search,
+        ref_file_ids=ref_file_ids,
     )
 
 
@@ -338,14 +405,15 @@ _KEEPALIVE_SECONDS = 10.0
 
 
 async def _tool_stream(req: ChatCompletionRequest, prompt: str, model_type,
-                       cache_req: ChatCompletionRequest = None):
+                       cache_req: ChatCompletionRequest = None,
+                       ref_file_ids=None):
     """Stream a buffered tool-call reply without tripping the client's timeout.
 
     Tool calls are emulated by buffering the whole reply before parsing, which
     can take minutes for a large write/edit. We run that work as a task and emit
     SSE keep-alive comments while it runs so the client's idle timer never fires.
     """
-    task = asyncio.ensure_future(_run_tool_chat(prompt, req, model_type))
+    task = asyncio.ensure_future(_run_tool_chat(prompt, req, model_type, ref_file_ids))
     try:
         while True:
             done, _ = await asyncio.wait({task}, timeout=_KEEPALIVE_SECONDS)
@@ -375,7 +443,8 @@ async def _tool_stream(req: ChatCompletionRequest, prompt: str, model_type,
 
 def _stream_with_retry(client: DeepSeekClient, prompt: str,
                        req: ChatCompletionRequest, model_type,
-                       cache_req: ChatCompletionRequest = None):
+                       cache_req: ChatCompletionRequest = None,
+                       ref_file_ids=None):
     """Stream a plain-text completion behind the safety gate.
 
     Refreshes the session once if the very first chunk fails with an auth error
@@ -385,7 +454,7 @@ def _stream_with_retry(client: DeepSeekClient, prompt: str,
     try:
         with _gate.turn():
             _cooldown.ensure()
-            stream = _open_stream(client, prompt, req, model_type)
+            stream = _open_stream(client, prompt, req, model_type, ref_file_ids)
             it = iter(stream)
             try:
                 first = next(it, _MISSING)
@@ -400,7 +469,7 @@ def _stream_with_retry(client: DeepSeekClient, prompt: str,
                 except Exception as e2:
                     yield _sse_error(f"Session refresh failed: {e2}", "login_required")
                     return
-                stream = _open_stream(client, prompt, req, model_type)
+                stream = _open_stream(client, prompt, req, model_type, ref_file_ids)
                 it = iter(stream)
                 try:
                     first = next(it, _MISSING)
@@ -538,6 +607,15 @@ async def chat_completions(req: ChatCompletionRequest):
         effective_req.messages, effective_req.tools, effective_req.tool_choice
     )
 
+    # OpenAI vision messages carry images as image_url parts. DeepSeek Web does
+    # not accept those parts in the prompt; it requires a file upload followed
+    # by ref_file_ids in the completion body.
+    image_file_ids: list[str] = []
+    try:
+        image_file_ids, _ = await _upload_images(effective_req)
+    except Exception as e:
+        return _error(f"Image upload failed: {e}", status=400, err_type="invalid_request_error")
+
     # Stop before touching the account when paused or over a local budget.
     try:
         _cooldown.ensure()
@@ -551,12 +629,12 @@ async def chat_completions(req: ChatCompletionRequest):
     if effective_req.tools:
         if effective_req.stream:
             return StreamingResponse(
-                _tool_stream(effective_req, prompt, model_type, cache_req),
+                _tool_stream(effective_req, prompt, model_type, cache_req, image_file_ids),
                 media_type="text/event-stream",
             )
         try:
             reply, content, tool_calls = await _run_tool_chat(
-                prompt, effective_req, model_type
+                prompt, effective_req, model_type, image_file_ids
             )
         except LoginRequired as e:
             return _error(str(e), status=503, err_type="login_required")
@@ -581,13 +659,13 @@ async def chat_completions(req: ChatCompletionRequest):
 
         def gen():
             yield from _stream_with_retry(
-                client, prompt, effective_req, model_type, cache_req
+                client, prompt, effective_req, model_type, cache_req, image_file_ids
             )
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
     try:
-        reply = await _run_chat_with_retry(prompt, effective_req, model_type)
+        reply = await _run_chat_with_retry(prompt, effective_req, model_type, image_file_ids)
     except LoginRequired as e:
         return _error(str(e), status=503, err_type="login_required")
     except (CooldownActive, BudgetExceeded) as e:

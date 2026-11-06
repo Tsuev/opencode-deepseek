@@ -12,7 +12,7 @@ from .config import DEFAULT_MODEL
 class ChatMessage(BaseModel):
     role: str
     # content is a plain string, or a list of parts (OpenAI vision-style). We only
-    # read text parts; non-text parts are ignored.
+    # Text and OpenAI vision-style content parts are accepted.
     content: Union[str, List[dict], None] = None
     # Tool-calling fields. DeepSeek's web protocol has no tool channel, so these
     # are accepted for OpenAI compatibility and emulated via prompt injection

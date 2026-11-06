@@ -91,8 +91,8 @@ REFRESH_BROWSER_CHANNEL_FALLBACK = os.getenv("REFRESH_BROWSER_CHANNEL_FALLBACK",
 # per call via `tool_names` (see deepseek.client.KNOWN_TOOLS), never encoded in
 # the model name.
 #
-# "vision" is deferred: it only does anything with an image attached, which needs
-# ref_file_ids / file-upload plumbing we don't have yet.
+# Images are accepted in OpenAI multimodal messages. The API layer uploads them
+# to DeepSeek Web and passes the resulting ref_file_ids to the completion.
 MODEL_MAP = {
     "deepseek-chat":   "default",   # Instant — the fast default model
     "deepseek-expert": "expert",    # Expert  — the stronger, slower model
