@@ -652,7 +652,9 @@ combination of signals:
 - **Most OpenAI parameters are ignored** (`temperature`, `top_p`, `max_tokens`,
   etc.). Only `model`, `messages`, `stream`, `conversation_id`, `thinking`,
   `search` take effect.
-- **Vision is not supported** (no image upload).
+- **Vision is supported** for OpenAI-style `image_url` parts, including base64
+  data URLs. The bridge uploads the image to DeepSeek Web and passes its
+  `ref_file_ids` to the completion request.
 - **Conversation id.** `conversation_id` fixes the model when a thread is
   created; on continuation `model` is ignored.
 - **Rate limit.** A local `429` (quota, cooldown, or `RATE_LIMIT_PER_MINUTE`)

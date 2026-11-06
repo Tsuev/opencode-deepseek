@@ -59,6 +59,33 @@ def _text_of(content) -> str:
     return "\n".join(parts)
 
 
+def image_sources(content) -> List[str]:
+    """Return image URLs/data URLs from common OpenAI/AI SDK content parts."""
+    if not isinstance(content, list):
+        return []
+    result = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        part_type = part.get("type")
+        if part_type == "image_url":
+            value = part.get("image_url")
+            url = value.get("url") if isinstance(value, dict) else value
+            if isinstance(url, str) and url:
+                result.append(url)
+        elif part_type in {"image", "file"}:
+            value = part.get("url") or part.get("data") or part.get("file_data")
+            if isinstance(part.get("image_url"), dict):
+                value = part["image_url"].get("url")
+            if isinstance(part.get("file"), dict):
+                file_obj = part["file"]
+                value = (file_obj.get("url") or file_obj.get("data") or
+                         file_obj.get("file_data") or file_obj.get("file_url"))
+            if isinstance(value, str) and value:
+                result.append(value)
+    return result
+
+
 # --- tool emulation: prompt injection ------------------------------------
 
 
