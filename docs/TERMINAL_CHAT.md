@@ -200,7 +200,7 @@ curl -s http://localhost:8000/v1/chat/completions \
 ```
 
 Для opencode это провайдер с `baseURL = http://localhost:8000/v1` и любым
-непустым API-ключом — см. раздел «Интеграция с opencode» в `README.md`.
+непустым API-ключом — см. раздел «Интеграция с opencode» в `README.ru.md`.
 
 ---
 
